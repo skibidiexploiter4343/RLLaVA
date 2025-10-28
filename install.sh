@@ -1,6 +1,22 @@
 #!/bin/bash
 
 # RLLaVA One-Click Installation Script
+#
+# Usage:
+#   ./install.sh [--fast|-f]
+#
+# Environment Variables:
+#   PYPI_MIRROR: Specify a custom PyPI mirror source
+#     Examples:
+#       export PYPI_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
+#       export PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+#       export PYPI_MIRROR="https://mirrors.cloud.tencent.com/pypi/simple"
+#       export PYPI_MIRROR="https://mirrors.163.com/pypi/simple"
+#
+# Options:
+#   --fast, -f: Skip version checks and force reinstall packages
+#
+# The script will automatically try multiple mirror sources if the primary one fails.
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
@@ -11,6 +27,24 @@ FAST_MODE=false
 if [ "$1" = "--fast" ] || [ "$1" = "-f" ]; then
     FAST_MODE=true
     echo "⚡ Fast mode enabled - skipping version checks"
+fi
+
+# PyPI mirror configuration
+# Default mirror sources (can be overridden by environment variable PYPI_MIRROR)
+DEFAULT_MIRRORS=(
+    "https://mirrors.aliyun.com/pypi/simple/"
+    "https://pypi.tuna.tsinghua.edu.cn/simple"
+    "https://mirrors.cloud.tencent.com/pypi/simple"
+    "https://mirrors.163.com/pypi/simple"
+)
+
+# Set mirror source from environment variable or use default
+if [ -n "$PYPI_MIRROR" ]; then
+    PYPI_INDEX_URL="$PYPI_MIRROR"
+    echo "🔧 Using custom PyPI mirror: $PYPI_INDEX_URL"
+else
+    PYPI_INDEX_URL="${DEFAULT_MIRRORS[0]}"
+    echo "🔧 Using default PyPI mirror: $PYPI_INDEX_URL"
 fi
 
 # Color definitions
@@ -35,6 +69,39 @@ print_warning() {
 
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Install package with mirror fallback
+install_with_mirror_fallback() {
+    local package=$1
+    local extra_flags=$2
+    
+    # Try primary mirror first
+    if pip install $package $extra_flags -i "$PYPI_INDEX_URL"; then
+        return 0
+    fi
+    
+    # If primary mirror fails, try other mirrors
+    print_warning "Failed to install $package from primary mirror, trying fallback mirrors..."
+    for mirror in "${DEFAULT_MIRRORS[@]}"; do
+        if [ "$mirror" != "$PYPI_INDEX_URL" ]; then
+            print_info "Trying mirror: $mirror"
+            if pip install $package $extra_flags -i "$mirror"; then
+                print_success "Successfully installed $package from $mirror"
+                return 0
+            fi
+        fi
+    done
+    
+    # If all mirrors fail, try default PyPI
+    print_warning "All mirrors failed, trying default PyPI..."
+    if pip install $package $extra_flags; then
+        print_success "Successfully installed $package from default PyPI"
+        return 0
+    fi
+    
+    print_error "Failed to install $package from all sources"
+    return 1
 }
 
 # Check Python version
@@ -188,6 +255,7 @@ install_basic_deps() {
     
     # Basic packages (no compilation required)
     basic_packages=(
+        "deprecated==1.2.18"
         "torch==2.6.0"
         "torchvision==0.21.0" 
         "torchaudio==2.6.0"
@@ -242,10 +310,9 @@ install_basic_deps() {
             print_info "✓ [$current/$total] $package is already installed"
         else
             print_info "[$current/$total] Installing $package..."
-        pip install "$package" -i https://mirrors.aliyun.com/pypi/simple/ || {
-                print_warning "Failed to install $package from Aliyun source, trying default source..."
-            pip install "$package"
-        }
+            install_with_mirror_fallback "$package" || {
+                print_warning "Failed to install $package, continuing with next package..."
+            }
         fi
     done
     
@@ -270,10 +337,9 @@ install_compile_deps() {
             print_info "✓ $package is already installed"
         else
             print_info "Installing $package..."
-        pip install "$package" -i https://mirrors.aliyun.com/pypi/simple/ || {
-                print_warning "Failed to install $package from Aliyun source, trying default source..."
-            pip install "$package"
-        }
+            install_with_mirror_fallback "$package" || {
+                print_warning "Failed to install $package, continuing with next package..."
+            }
         fi
     done
 }
@@ -311,9 +377,9 @@ install_optional_packages() {
         else
             print_info "Installing $package..."
             # Use --no-deps to avoid reinstalling dependencies that may cause conflicts
-            pip install "$package" --no-deps -i https://mirrors.aliyun.com/pypi/simple/ || {
-                print_warning "$package installation failed, trying with dependencies..."
-                pip install "$package" -i https://mirrors.aliyun.com/pypi/simple/ || {
+            install_with_mirror_fallback "$package" "--no-deps" || {
+                print_warning "$package installation failed with --no-deps, trying with dependencies..."
+                install_with_mirror_fallback "$package" || {
                     print_warning "$package installation failed, skipping..."
                 }
             }
@@ -328,9 +394,9 @@ install_optional_packages() {
         # Check if CUDA_HOME is properly set
         if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
             print_info "Using CUDA_HOME: $CUDA_HOME"
-            CUDA_HOME="$CUDA_HOME" pip install deepspeed==0.15.4 -i https://mirrors.aliyun.com/pypi/simple/ || {
+            CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4" || {
                 print_warning "DeepSpeed installation failed, trying with no-build-isolation..."
-                CUDA_HOME="$CUDA_HOME" pip install deepspeed==0.15.4 --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ || {
+                CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4" "--no-build-isolation" || {
                     print_warning "DeepSpeed installation failed, skipping..."
                 }
             }
@@ -347,6 +413,7 @@ install_optional_packages() {
         print_info "✓ flash-attn==2.7.4.post1 is already installed"
     else
         print_info "Installing Flash Attention..."
+        
         # Check if CUDA_HOME is properly set
         if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
             print_info "Using CUDA_HOME: $CUDA_HOME"
@@ -355,33 +422,41 @@ install_optional_packages() {
             PYTHON_VERSION=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
             print_info "Detected Python version tag: $PYTHON_VERSION"
             
-            # Try multiple strategies to install Flash Attention
-            print_info "Attempting Flash Attention installation..."
+            # Important notice before starting the installation
+            echo ""
+            print_info "⚠️  IMPORTANT: Flash Attention installation can be slow when building from source."
+            print_info "To speed up installation, you can download the pre-built wheel file:"
+            echo ""
+            echo "  1. Download the wheel file:"
+            echo "     wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+            echo ""
+            echo "  2. Install from the downloaded wheel:"
+            echo "     pip install flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+            echo ""
+            print_info "Press Ctrl+C now if you want to use the faster method above."
+            print_info "Otherwise, the installation will continue automatically in 5 seconds..."
+            sleep 5
+            echo ""
             
-            # Strategy 1: Try PyPI default (may have cached wheels from setup.py)
-            print_info "Strategy 1: Trying default PyPI..."
-            pip install flash-attn==2.7.4.post1 --no-build-isolation 2>&1 | grep -q "Successfully installed" && {
+            # Try multiple strategies to install Flash Attention
+            print_info "Attempting Flash Attention installation from source (this may take several hours)..."
+            
+            # Try installing Flash Attention with mirror fallback
+            if install_with_mirror_fallback "flash-attn==2.7.4.post1" "--no-build-isolation"; then
                 print_success "Flash Attention installed successfully"
-            } || {
-                # Strategy 2: Try Aliyun mirror
-                print_warning "Strategy 1 failed, trying Strategy 2: Aliyun mirror..."
-                pip install flash-attn==2.7.4.post1 --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ 2>&1 | grep -q "Successfully installed" && {
-                    print_success "Flash Attention installed successfully from Aliyun"
-                } || {
-                    # Strategy 3: Try Tsinghua mirror
-                    print_warning "Strategy 2 failed, trying Strategy 3: Tsinghua mirror..."
-                    pip install flash-attn==2.7.4.post1 --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple 2>&1 | grep -q "Successfully installed" && {
-                        print_success "Flash Attention installed successfully from Tsinghua"
-                    } || {
-                        # All attempts failed
-                        print_warning "Flash Attention installation failed after multiple attempts"
-                        print_warning "This is optional and the project can run without it (with reduced performance)"
-                        print_info "You can try installing it manually later with:"
-                        echo "  export CUDA_HOME=$CUDA_HOME"
-                        echo "  pip install flash-attn==2.7.4.post1 --no-build-isolation"
-                    }
-                }
-            }
+            else
+                # All attempts failed
+                print_warning "Flash Attention installation failed after multiple attempts"
+                print_warning "This is optional and the project can run without it (with reduced performance)"
+                print_info "You can try installing it manually later with:"
+                echo "  Method 1 (Recommended - Using pre-built wheel):"
+                echo "    wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+                echo "    pip install flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+                echo ""
+                echo "  Method 2 (Build from source):"
+                echo "    export CUDA_HOME=$CUDA_HOME"
+                echo "    pip install flash-attn==2.7.4.post1 --no-build-isolation"
+            fi
         else
             print_warning "CUDA_HOME not properly configured, skipping Flash Attention installation"
             print_info "To install Flash Attention manually:"
@@ -394,9 +469,8 @@ install_optional_packages() {
 # Install current package
 install_package() {
     print_info "Installing rllava package..."
-    pip install -e . --no-deps -i https://mirrors.aliyun.com/pypi/simple/ || {
-        print_warning "Failed to install from Aliyun source, trying default source..."
-        pip install -e . --no-deps
+    install_with_mirror_fallback "-e ." "--no-deps" || {
+        print_warning "Failed to install rllava package, continuing..."
     }
 }
 
@@ -462,7 +536,9 @@ main() {
     
     # Upgrade pip
     print_info "Upgrading pip..."
-    pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/
+    install_with_mirror_fallback "--upgrade pip" || {
+        print_warning "Failed to upgrade pip, continuing..."
+    }
     
     print_info "Starting smart installation with duplicate checking..."
     print_warning "Note: The script will skip packages that are already installed with correct versions"

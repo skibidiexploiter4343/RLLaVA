@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Any
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from rllava.utils.logging import print_rank0
+from rllava.utils.logger.aggregate_logger import print_rank_0
 from rllava.ppo.utils.metrics import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics, compute_length_metrics
 from rllava.utils.py_functional import timer
 from rllava.train.pipeline.base import Pipeline
@@ -29,7 +29,7 @@ class RLVRPipeline(Pipeline):
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
         reward_metrics_lst = defaultdict(list)
         length_metrics_lst = defaultdict(list)
-        print_rank0("Start validation...")
+        print_rank_0("Start validation...")
         with self.model.generate_context():
             iterator = iter(self.val_dataloader)
             while True:

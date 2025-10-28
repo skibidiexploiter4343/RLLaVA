@@ -142,7 +142,7 @@ class HFAccelerator(TrainEngine):
         else:
             init_context = cpu_init_weights
         return init_context
-    
+
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model)
     
@@ -167,17 +167,17 @@ class HFAccelerator(TrainEngine):
                 yield unwrapped_model
         return _unwrap_model_for_generation
 
-    def load_state(self, checkpoint_path):
+    def load_state(self, model, optimizer, lr_scheduler, checkpoint_path):
         self.accelerator.load_state(checkpoint_path)
 
-    def save_state(self, checkpoint_path):
+    def save_state(self, model, optimizer, lr_scheduler, checkpoint_path):
         self.accelerator.save_state(checkpoint_path)
 
     def backward(self, loss):
         self.accelerator.backward(loss)
 
-    def clip_grad_norm_(self, parameters, max_norm):
-        return self.accelerator.clip_grad_norm_(parameters, max_norm)
+    def clip_grad_norm_(self, model, max_norm):
+        return self.accelerator.clip_grad_norm_(model.parameters(), max_norm)
     
     def get_model_weights(self, model=None):
         """Get model weights for syncing with inference engines.

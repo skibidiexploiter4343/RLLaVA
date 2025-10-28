@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, Optional
 from dataclasses import asdict, dataclass, field
-from rllava.utils.config import BaseConfig, ModelConfig, OptimConfig, FSDPConfig, DeepSpeedConfig
+from rllava.utils.config import BaseConfig, ModelConfig, OptimConfig, FSDPConfig, DeepSpeedConfig, CheckpointConfig
 from rllava.engine import VLLMConfig, SGLangConfig
     
 
@@ -152,8 +152,9 @@ class ActorConfig:
     # UFT-style joint SFT loss (cross-entropy over ground_truth)
     sft_loss_coef: float = 0.0
     model: ModelConfig = field(default_factory=ModelConfig)
-    policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
+    policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
     global_batch_size_per_device: int = field(default=-1, init=False)

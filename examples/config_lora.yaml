@@ -50,7 +50,6 @@ actor:
     strategy: adamw  # {adamw, adamw_bf16}
     lr_warmup_ratio: 0.0
   fsdp:
-    enable_full_shard: true
     enable_cpu_offload: true
     use_orig_params: true
     offload_params: true  # true: more CPU memory; false: more GPU memory
@@ -75,7 +74,6 @@ rollout:
 critic: null
 ref:
   fsdp:
-    enable_full_shard: true
     enable_cpu_offload: true  # true: more CPU memory; false: more GPU memory
     offload_params: true
 reward:

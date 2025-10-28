@@ -12,14 +12,14 @@ from deprecated import deprecated
 from ..config import ActorConfig
 from rllava.data.protocol import DataProto
 from rllava.utils.device import get_torch_device
-from rllava.utils.logging import print_rank0
+from rllava.utils.logger.aggregate_logger import print_rank_0
 from rllava.utils.torch_dtypes import PrecisionType
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import AutoModelForVision2Seq, AutoModelForCausalLM, AutoConfig
 from einops import rearrange
 from rllava.utils import torch_functional as VF
-from rllava.utils.torch_functional import get_constant_schedule_with_warmup
+from rllava.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from rllava.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from rllava.utils.flops_counter import FlopsCounter
 from rllava.utils.py_functional import append_to_dict
@@ -29,7 +29,7 @@ from rllava.utils.model_utils import print_model_size
 from rllava.utils.performance import log_gpu_memory_usage
 from rllava.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from rllava.utils.device import get_device_name
-from rllava.engine import TrainEngine
+from rllava.engine import EngineFactory
 from rllava.utils.train_utils import find_all_linear_names
 from rllava.utils.dist_utils import is_rank0
 from contextlib import nullcontext
@@ -48,16 +48,17 @@ device_name = get_device_name()
 
 
 class Actor():
-    def __init__(self, config: ActorConfig, policy_loss=None, tokenizer=None, accelerator: TrainEngine = None):
+    def __init__(self, config: ActorConfig, policy_loss=None, tokenizer=None, processor=None):
         self.config = config
         self.policy_loss = policy_loss
         self.tokenizer = tokenizer
-        
+        self.processor = processor        
         self.model = None
         self.is_peft_model = False
         self.optimizer = None
         self.lr_scheduler = None
-        self.accelerator = accelerator
+
+        self.accelerator = EngineFactory(config.strategy)(config)
             
         if config.use_torch_compile:
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
@@ -72,7 +73,7 @@ class Actor():
         if self.config.global_batch_size_per_device % self.config.ppo_micro_batch_size_per_gpu != 0:
             raise ValueError(f"Actor global batch size per device must be divisible by the micro batch size.")
         
-        print_rank0(f"Actor will use global batch size per device {self.config.global_batch_size_per_device}.")
+        print_rank_0(f"Actor will use global batch size per device {self.config.global_batch_size_per_device}.")
 
     def initialize(self, model_config: AutoConfig):
         if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
@@ -92,7 +93,7 @@ class Actor():
         return self.accelerator.unwrap_model_for_generation(self.model, self.is_peft_model)
 
     def load_checkpoint(self, checkpoint_path: str):
-        self.accelerator.load_state(checkpoint_path) 
+        self.accelerator.load_state(self.model, self.optimizer, self.lr_scheduler, checkpoint_path) 
 
     def save_checkpoint(self, checkpoint_path: str, save_model_only: bool = False):
         if save_model_only:
@@ -101,21 +102,22 @@ class Actor():
                 torch.save(unwrapped_model.state_dict(), os.path.join(checkpoint_path, "model.pt"))
         else:
             # Call save_state on ALL ranks; Accelerate will coordinate and only write once.
-            self.accelerator.save_state(checkpoint_path)
+            self.accelerator.save_state(self.model, self.optimizer, self.lr_scheduler, checkpoint_path)
         self.accelerator.wait_for_everyone()
 
     def init_model(self, model_class, model_config):
         """Initialize model in Actor class."""
-        print_rank0("Initializing model in Actor class...")
-
+        log_gpu_memory_usage(f"Before init Actor from HF AutoModel", logger=logger)
         # Load model
         torch_dtype = self.config.model.torch_dtype
         if torch_dtype is None:
-            torch_dtype = torch.float32
+            # torch_dtype = torch.float32
+            torch_dtype = torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
-
-        init_weight = self.accelerator.get_init_weight_context(use_meta_tensor=not self.config.model.tie_word_embeddings)
+        
+        init_weight = self.accelerator.get_init_weight_context(
+            use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.accelerator.device_mesh)
         with init_weight():
             self.model = model_class.from_pretrained(
                 self.config.model.model_path,
@@ -124,11 +126,13 @@ class Actor():
                 attn_implementation=self.config.model.attn_implementation,
                 trust_remote_code=self.config.model.trust_remote_code,
             )
+            self.model.to(torch_dtype)
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
         self.config.model.lora_target_modules = find_all_linear_names(self.model, ['visual','connector', 'vision_tower'] )
         peft_config = get_peft_config(self.config.model)
-
+        
         if peft_config is not None:
             self.is_peft_model = True
             self.model.enable_input_require_grads()
@@ -136,11 +140,12 @@ class Actor():
             peft_model = get_peft_model(self.model, peft_config)
             self.model = peft_model
 
-        if is_rank0() == 0:
+        if is_rank0(): 
             print_model_size(self.model)
         log_gpu_memory_usage(f"After init Actor from HF AutoModel", logger=logger)
         self.model = self.accelerator.prepare(self.model)
         log_gpu_memory_usage(f"After Actor Accelerator prepare", logger=logger)
+
 
         # Handle reference model if needed
         if self.config.use_kl_loss or self.config.use_kl_in_reward:
@@ -162,9 +167,9 @@ class Actor():
                     param.requires_grad = False
 
             log_gpu_memory_usage(f"After init Ref from HF AutoModel", logger=logger)
-            self.ref_model = self.accelerator.prepare(self.ref_model)
+            self.ref_model = self.accelerator.prepare(self.ref_model, forward_only=True)
             log_gpu_memory_usage(f"After Ref Accelerator prepare", logger=logger)
-
+               
     def init_optimizer(self):
         # Create optimizer
         if self.config.optim.strategy == "adamw":
@@ -185,23 +190,33 @@ class Actor():
             )
         else:
             raise NotImplementedError(f"Optimizer {self.config.optim.strategy} not supported.")
-
-        # Create learning rate scheduler
+        
+        # Create learning rate scheduler   
         if self.config.optim.lr_warmup_steps is not None:
             num_warmup_steps = self.config.optim.lr_warmup_steps
         else:
             num_warmup_steps = int(self.config.optim.lr_warmup_ratio * self.config.optim.training_steps)
+        
+        if self.config.optim.lr_scheduler_type == "constant":
+            self.lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
+            )
+        elif self.config.optim.lr_scheduler_type == "cosine":
+            self.lr_scheduler = get_cosine_schedule_with_warmup(
+                optimizer=self.optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=self.config.optim.training_steps,
+                min_lr_ratio=self.config.optim.min_lr_ratio,
+                num_cycles=self.config.optim.num_cycles,
+            )
 
-        self.lr_scheduler = get_constant_schedule_with_warmup(
-            optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
-        )
         self.optimizer, self.lr_scheduler = self.accelerator.prepare(self.optimizer, self.lr_scheduler)
         log_gpu_memory_usage(f"After Optimizer and LR Scheduler Accelerator prepare", logger=logger)
 
     @deprecated("Use init_model and init_optimizer instead")
     def _init_model_and_optimizer(self, model_class, model_config):
         """Initialize model and optimizer directly in Actor class."""
-        print_rank0("Initializing model and optimizer in Actor class...")
+        print_rank_0("Initializing model and optimizer in Actor class...")
         
         # Load model
         torch_dtype = self.config.model.torch_dtype
@@ -210,7 +225,7 @@ class Actor():
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
         
-        init_weight = self.accelerator.get_init_weight_context(use_meta_tensor=not self.config.model.tie_word_embeddings)
+        init_weight = self.accelerator.get_init_weight_context(use_meta_tensor=not model_config.tie_word_embeddings)
         with init_weight():
             self.model = model_class.from_pretrained(
                 self.config.model.model_path,
@@ -231,7 +246,7 @@ class Actor():
             peft_model = get_peft_model(self.model, peft_config)
             self.model = peft_model
 
-        if is_rank0() == 0:
+        if is_rank0() == 0: 
             print_model_size(self.model)
         log_gpu_memory_usage(f"After init Actor from HF AutoModel", logger=logger)
         self.model = self.accelerator.prepare(self.model)
@@ -440,8 +455,7 @@ class Actor():
         else:
             model = self.model
         ctx = model.disable_adapter() if self.is_peft_model == True and is_ref else nullcontext()
-        with ctx:
-            model.eval()
+        with ctx, self.accelerator.eval(model):
             for micro_batch in micro_batches:
                 model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                 _, log_probs, _ = self._forward_micro_batch(model=model, micro_batch=model_inputs, temperature=temperature)
@@ -456,7 +470,8 @@ class Actor():
     def update(self, data: DataProto):
         # Perform training with Accelerator
         with Timer(name="update_policy", logger=None) as timer:
-            metrics = self.update_policy(data=data)
+            with self.accelerator.train(model=self.model, optimizer=self.optimizer):
+                metrics = self.update_policy(data=data)
 
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
@@ -483,7 +498,6 @@ class Actor():
     
     def update_policy(self, data: DataProto):
         """Update policy using Accelerator for unified training management."""
-        self.model.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = [
@@ -627,20 +641,21 @@ class Actor():
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
+        self.optimizer.zero_grad()
         return metrics
     
     def _optimizer_step(self):
         """Perform optimizer step with Accelerator support."""
         grad_norm = self.accelerator.clip_grad_norm_(
-                        self.model.parameters(), self.config.max_grad_norm
+                        self.model, self.config.max_grad_norm
                     )
             
         if not torch.isfinite(grad_norm):
             print("Gradient norm is not finite. Skip update.")
+            self.optimizer.zero_grad()
         else:
             self.optimizer.step()
 
-        self.optimizer.zero_grad()
         return grad_norm
 
 

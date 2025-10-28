@@ -47,7 +47,7 @@ class VLLMEngine(InferenceEngine):
             skip_tokenizer_init=False,
             trust_remote_code=config.trust_remote_code,
             load_format=config.load_format,
-            dtype=PrecisionType.to_str(PrecisionType.to_dtype(config.vllm.dtype)),
+            dtype=config.vllm.dtype,
             seed=config.seed,
             max_model_len=config.vllm.max_model_len or config.prompt_length + config.response_length,
             distributed_executor_backend="external_launcher",
@@ -78,16 +78,7 @@ class VLLMEngine(InferenceEngine):
 
         print(f"Sampling params: {sampling_kwargs}.")
         self.sampling_params = SamplingParams(**sampling_kwargs)
-
         self.loaded = False
-        # Track freed bytes around vLLM sleep/wake for memory logs/estimation
-        self.freed_bytes = 0
-        # Record and manage RNG states to keep TP ranks in sync
-        self.torch_random_states = torch.cuda.get_rng_state()
-        gen_dp_rank = 0 if self.device_mesh is None else self.device_mesh["dp"].get_local_rank()
-        torch.cuda.manual_seed(gen_dp_rank + 1000)
-        self.gen_random_states = torch.cuda.get_rng_state()
-        torch.cuda.set_rng_state(self.torch_random_states)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -239,27 +230,15 @@ class VLLMEngine(InferenceEngine):
             self.inference_engine.wake_up(tags=["kv_cache"])
 
         print_gpu_memory_usage("After vllm wake up in vllm engine")
-        # important: need to manually set the random states of each tp to be identical.
-        if self.device_mesh is not None:
-            self.torch_random_states = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(self.gen_random_states)
 
     def offload(self):
         assert self.loaded is True, "vllm engine has not been loaded"
         
         print_gpu_memory_usage("Before vllm offload in vllm engine")
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
         self.inference_engine.sleep(level=1)
-        free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
-        self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         print_gpu_memory_usage("After vllm offload in vllm engine")
 
         torch.cuda.empty_cache()
-
-        # restore random states
-        if self.device_mesh is not None:
-            self.gen_random_states = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(self.torch_random_states)
         self.loaded = False
 
     def _make_weight_iterator(self, weights: Dict[str, torch.Tensor]):
@@ -275,21 +254,8 @@ class VLLMEngine(InferenceEngine):
             tensor = weights[name]
             # Handle DTensor for distributed training
             if hasattr(tensor, 'full_tensor'):
-                yield name, tensor.full_tensor() if self.num_processes != 1 else tensor
+                yield name, tensor.full_tensor() if self.world_size != 1 else tensor
             else:
                 yield name, tensor 
 
-    # def preprocess_data(self, data: DataProto) -> DataProto:
-    #     # All gather across TP group only when using tensor parallelism and when input is local shards
-    #     is_global = bool(data.meta_info.get("is_global", False)) if hasattr(data, "meta_info") else False
-    #     if self.tp_size > 1 and not is_global:
-    #         all_gather_data_proto(data, size=self.tp_size, group=self.tp_group)
-    #     return data
-
-    # def postprocess_data(self, data: DataProto) -> DataProto:
-    #     # If input was gathered to global in preprocess, scatter back per TP rank
-    #     is_global = bool(data.meta_info.get("is_global", False)) if hasattr(data, "meta_info") else False
-    #     if self.tp_size > 1 and not is_global:
-    #         data = data.chunk(chunks=self.tp_size)[self.tp_rank]
-    #     return data
     

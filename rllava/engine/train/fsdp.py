@@ -9,138 +9,39 @@ Subsequent steps will extend this skeleton with full training utilities.
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterable, Optional
-
+import functools
+import logging
+import warnings
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.optim import Optimizer
-try:  # torch >= 2.4
-    from torch.optim.lr_scheduler import LRScheduler
-except ImportError:  # torch < 2.4
-    from torch.optim.lr_scheduler import _LRScheduler as LRScheduler  # type: ignore
 
+from contextlib import contextmanager, nullcontext
+from typing import Any, Dict, Iterable, Optional
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor
+from transformers.trainer_pt_utils import get_module_class_from_name
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from rllava.engine.train.base import TrainEngine
+from rllava.utils.performance import log_gpu_memory_usage
+from rllava.utils.dist_utils import is_rank0
+from rllava.utils.logger.aggregate_logger import log_with_rank
+from rllava.utils.config import FSDPConfig, CheckpointConfig
+from rllava.utils.device import get_device_id, get_torch_device, get_device_name, is_cuda_available
+from rllava.utils.memory_utils import aggressive_empty_cache
+from rllava.utils.fs import local_mkdir_safe, copy_to_local
+from rllava.utils.checkpoint.checkpoint_manager import BaseCheckpointManager
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType, ShardedOptimStateDictConfig
+from torch.distributed.fsdp._runtime_utils import _lazy_init
 from .. import register_engine
 
 
-try:
-    from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel, MixedPrecision, ShardingStrategy
-    from torch.distributed.fsdp import FlatParameter
-except Exception:  # pragma: no cover - handled dynamically at runtime
-    CPUOffload = None  # type: ignore
-    MixedPrecision = None  # type: ignore
-    FullyShardedDataParallel = None  # type: ignore
-    ShardingStrategy = None  # type: ignore
-    FlatParameter = nn.Parameter  # type: ignore
 
-
-def _resolve_torch_dtype(dtype_str: Optional[str], fallback: torch.dtype = torch.float32) -> torch.dtype:
-    if not dtype_str:
-        return fallback
-    normalized = dtype_str.lower()
-    mapping = {
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        "fp16": torch.float16,
-        "half": torch.float16,
-        "float16": torch.float16,
-        "fp32": torch.float32,
-        "float32": torch.float32,
-        "tf32": torch.float32,
-    }
-    return mapping.get(normalized, fallback)
-
-
-class _FSDPOffloadManager:
-    """Lightweight CPU offload helper for FSDP modules and optimizers."""
-
-    def __init__(self, module: nn.Module, optimizers: list[Optimizer], grad_offload: bool, optim_offload: bool):
-        self._module = module
-        self._optimizers = optimizers
-        self._grad_offload = grad_offload
-        self._optim_offload = optim_offload
-        self._cached_param_devices: dict[nn.Parameter, torch.device] = {}
-        self._cached_grad_devices: dict[nn.Parameter, torch.device] = {}
-
-    def _iter_params(self):
-        params = list(self._module.parameters())
-        flat_params = [p for p in params if isinstance(p, FlatParameter)]
-        if flat_params:
-            return flat_params
-        return params
-
-    def offload_parameters(self) -> None:
-        for param in self._iter_params():
-            if not param.is_cuda:
-                continue
-            self._cached_param_devices[param] = param.device
-            param.data = param.data.cpu()
-
-    def load_parameters(self, non_blocking: bool = True) -> None:
-        for param in self._iter_params():
-            last_device = self._cached_param_devices.get(param, None)
-            if last_device is None or param.is_cuda:
-                continue
-            param.data = param.data.to(last_device, non_blocking=non_blocking)
-
-    def offload_gradients(self) -> None:
-        if not self._grad_offload:
-            return
-        for param in self._iter_params():
-            grad = param.grad
-            if grad is None or not grad.is_cuda:
-                continue
-            self._cached_grad_devices[param] = grad.device
-            param.grad = grad.cpu()
-
-    def load_gradients(self, non_blocking: bool = True) -> None:
-        if not self._grad_offload:
-            return
-        for param in self._iter_params():
-            grad = param.grad
-            if grad is None or grad.is_cuda:
-                continue
-            target_device = self._cached_grad_devices.get(param, None)
-            if target_device is None:
-                target_device = self._cached_param_devices.get(param, None)
-            if target_device is None:
-                continue
-            param.grad = grad.to(target_device, non_blocking=non_blocking)
-
-    def offload_optimizers(self) -> None:
-        if not self._optim_offload:
-            return
-        for optimizer in self._optimizers:
-            self._move_optimizer_state(optimizer, torch.device("cpu"))
-
-    def load_optimizers(self, non_blocking: bool = True) -> None:
-        if not self._optim_offload:
-            return
-        target = self._infer_device()
-        if target is None:
-            return
-        for optimizer in self._optimizers:
-            self._move_optimizer_state(optimizer, target, non_blocking=non_blocking)
-
-    def _infer_device(self) -> Optional[torch.device]:
-        for param in self._iter_params():
-            if param.is_cuda:
-                return param.device
-            if param in self._cached_param_devices:
-                return self._cached_param_devices[param]
-        return None
-
-    def _move_optimizer_state(self, optimizer: Optimizer, device: torch.device, non_blocking: bool = True) -> None:
-        state = optimizer.state
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                state[key] = value.to(device, non_blocking=non_blocking)
-            elif isinstance(value, dict):
-                for inner_key, inner_val in value.items():
-                    if isinstance(inner_val, torch.Tensor):
-                        value[inner_key] = inner_val.to(device, non_blocking=non_blocking)
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("RLLAVA_LOGGING_LEVEL", "WARN"))
 
 
 @register_engine("fsdp")
@@ -163,101 +64,29 @@ class FSDPAccelerator(TrainEngine):
 
     def __init__(self, config):
         super().__init__(config)
-        if getattr(config, "strategy", None) not in {"fsdp", "fsdp2", None}:
-            raise ValueError(f"Unsupported training strategy: {config.strategy}")
+        self.fsdp_config = getattr(config, "fsdp", FSDPConfig())
+        self.checkpoint_config = getattr(config, "checkpoint", CheckpointConfig())
 
-        self.fsdp_config = getattr(config, "fsdp", None)
-        if self.fsdp_config is None:
-            raise ValueError("FSDP engine requires `config.fsdp` to be provided.")
+        self.device_mesh = create_device_mesh(world_size=self.world_size, 
+                                              fsdp_size=self.fsdp_config.fsdp_size)
 
-        self._mixed_precision_config = self._build_mixed_precision_config()
-        self._cpu_offload_config = self._build_cpu_offload_config()
-        self._use_orig_params = getattr(self.fsdp_config, "use_orig_params", False)
-        self._wrapped_models = []
-        self._optimizers: list[Optimizer] = []
-        self._lr_schedulers: list[LRScheduler] = []
-        self._state_filename = "fsdp_engine_state.pt"
-        self._offload_param = getattr(self.fsdp_config, "offload_params", False)
-        self._offload_optimizer = getattr(self.fsdp_config, "offload_optimizer", False)
-        self._offload_gradients = self._offload_param and getattr(self.fsdp_config, "enable_cpu_offload", False)
-        self._offload_managers: list[_FSDPOffloadManager] = []
-        
-        # LoRA configuration
-        model_config = getattr(config, "model", None)
-        self._lora_rank = getattr(model_config, "lora_rank", 0) if model_config else 0
-        self._is_lora = self._lora_rank > 0
-        self._lora_config = None
-        if self._is_lora and model_config:
-            self._lora_config = {
-                "lora_rank": getattr(model_config, "lora_rank", 8),
-                "lora_alpha": getattr(model_config, "lora_alpha", 16),
-                "target_modules": getattr(model_config, "target_modules", None),
-                "exclude_modules": getattr(model_config, "exclude_modules", None),
-            }
+        self.wrapped_models: list[FSDP] = []
+        self.optimizers: list[Optimizer] = []
+        self.lr_schedulers: list[LRScheduler] = []
 
-    # -------------------------------------------------------------------------
-    # Distributed metadata helpers
-    # -------------------------------------------------------------------------
-    @property
-    def world_size(self) -> int:
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_world_size()
-        return 1
-
-    @property
-    def rank(self) -> int:
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank()
-        return 0
-
-    @property
-    def num_processes(self) -> int:
-        return self.world_size
-
-    @property
-    def is_main_process(self) -> bool:
-        return self.rank == 0
-
-    # -------------------------------------------------------------------------
-    # Synchronization helpers
-    # -------------------------------------------------------------------------
-    def wait_for_everyone(self) -> None:
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-
-    # -------------------------------------------------------------------------
-    # Initialization helpers
-    # -------------------------------------------------------------------------
-    def get_init_weight_context(self, use_meta_tensor: bool = True):
-        """
-        Provide an initialization context manager that mirrors verl's implementation.
-
-        This method mirrors the behavior of verl's get_init_weight_context_manager.
-        When use_meta_tensor=False (e.g., when model has tie_word_embeddings=True),
-        we avoid meta tensor initialization to preserve weight tying.
-        
-        When use_meta_tensor=True, non-rank-0 processes use meta tensor to save memory,
-        and rank-0 loads actual weights which are then synced by FSDP.
-        
-        Args:
-            use_meta_tensor: Whether to use meta tensor initialization for non-rank-0 processes.
-                           Set to False when model has weight tying (tie_word_embeddings).
-        
-        Returns:
-            A context manager or callable that can be invoked with ()
-        """
+    def get_init_weight_context(self, use_meta_tensor: bool = True, mesh: DeviceMesh = None):
         from accelerate import init_empty_weights
         
         cpu_init_weights = lambda: torch.device("cpu")
         if use_meta_tensor:
-            init_context = init_empty_weights if (torch.distributed.is_initialized() and self.rank != 0) else cpu_init_weights
+            if mesh is None:
+                init_context = init_empty_weights if not is_rank0() else cpu_init_weights
+            else:
+                init_context = init_empty_weights if mesh.get_coordinate()[-1] != 0 else cpu_init_weights
         else:
             init_context = cpu_init_weights
         return init_context
 
-    # -------------------------------------------------------------------------
-    # Placeholder interfaces to be filled in subsequent steps
-    # -------------------------------------------------------------------------
     def prepare(self, *args: Any, **kwargs: Any):
         """Wrap supported training artefacts with FSDP.
 
@@ -269,139 +98,178 @@ class FSDPAccelerator(TrainEngine):
         - ``Optimizer`` / ``LRScheduler`` instances are cached so their state
           can be saved/restored alongside the model.
         """
-        if kwargs:
-            raise NotImplementedError("Keyword argument handling for prepare is not implemented yet.")
-
-        prepared_items = [self._prepare_item(arg) for arg in args]
+        prepared_items = [self._prepare_item(arg, **kwargs) for arg in args]
         if len(prepared_items) == 1:
             return prepared_items[0]
         return tuple(prepared_items)
 
     def unwrap_model(self, model):
-        if isinstance(model, FullyShardedDataParallel):
+        if isinstance(model, FSDP):
             return model.module
         return model
 
+    @contextmanager
     def unwrap_model_for_generation(self, model, is_peft_model: bool = False):
-        base_model = self.unwrap_model(model)
+        aggressive_empty_cache(force_sync=True)
+        
+        if self.fsdp_config.offload_params:
+            log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+            load_fsdp_model_to_gpu(model)
+            log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
-        @contextmanager
-        def _ctx():
-            adapter_ctx = nullcontext()
-            if is_peft_model and hasattr(base_model, "disable_adapter"):
-                adapter_ctx = base_model.disable_adapter()
+        yield model  # we use wrapped model for FSDP
+        
+        if self.fsdp_config.offload_params:
+            log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+            offload_fsdp_model_to_cpu(model)
+            log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
-            with adapter_ctx:
-                # For FSDP, directly yield the wrapped model
-                # FSDP will handle state_dict() internally without deadlocks
-                # This matches the behavior of HFAccelerator
-                yield model
+    @contextmanager
+    def eval(self, model: FSDP):
+        if self.fsdp_config.offload_params:
+            load_fsdp_model_to_gpu(model)
+        model.eval()
 
-        return _ctx
+        yield
 
-    def load_state(self, checkpoint_path: str):
-        """Restore model/optimizer/scheduler states from ``checkpoint_path``."""
-        state_file = os.path.join(checkpoint_path, self._state_filename)
-        if not os.path.exists(state_file):
-            raise FileNotFoundError(f"Checkpoint file not found: {state_file}")
+        if self.world_size > 1:
+            model._handle.reshard(True)
 
-        payload = torch.load(state_file, map_location="cpu")
+        if self.fsdp_config.offload_params:
+            offload_fsdp_model_to_cpu(model)
 
-        model_states = payload.get("models", [])
-        if len(model_states) != len(self._wrapped_models):
-            raise RuntimeError(
-                "Mismatch between saved model count and currently wrapped models:"
-                f" {len(model_states)} vs {len(self._wrapped_models)}"
+    @contextmanager
+    def train(self, model: FSDP, optimizer: Optimizer):
+        if self.fsdp_config.offload_params:
+            load_fsdp_model_to_gpu(model)
+        if self.fsdp_config.offload_optimizer:
+            load_fsdp_optimizer(optimizer, device_id=get_device_id())
+        model.train()
+
+        yield
+
+        if self.world_size > 1:
+            model._handle.reshard(True)
+
+        if self.fsdp_config.offload_params:
+            offload_fsdp_model_to_cpu(model)
+        if self.fsdp_config.offload_optimizer:
+            offload_fsdp_optimizer(optimizer)
+
+    def load_state(self, model: FSDP, optimizer: Optimizer, lr_scheduler: LRScheduler, local_path: str):
+        if local_path is None:
+            return
+
+        if self.fsdp_config.offload_params:
+            load_fsdp_model_to_gpu(model)
+        if self.fsdp_config.offload_optimizer:
+            load_fsdp_optimizer(optimizer, device_id=get_device_id())
+
+        state_dict_cfg = (
+            ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+            if 'model' in self.checkpoint_config.load_contents
+            else None
+        )
+        optim_cfg = (
+            ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+            if 'optimizer' in self.checkpoint_config.load_contents
+            else None
+        )
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+            if 'model' in self.checkpoint_config.load_contents:
+                remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+                local_model_path = copy_to_local(remote_model_path)
+                model_state_dict = torch.load(local_model_path, weights_only=False)
+                model.load_state_dict(model_state_dict)
+                log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
+            if 'optimizer' in self.checkpoint_config.load_contents:
+                remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
+                local_optim_path = copy_to_local(remote_optim_path)
+                optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                optimizer.load_state_dict(optimizer_state_dict)
+                log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+
+        if 'extra' in self.checkpoint_config.load_contents:
+            remote_extra_state_path = os.path.join(
+                local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
             )
+            local_extra_state_path = copy_to_local(remote_extra_state_path)
+            extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+            # recover random state
+            if "rng" in extra_state_dict:
+                # 'rng' may not exist for backward compatibility
+                BaseCheckpointManager.load_rng_state(extra_state_dict["rng"])
+                log_with_rank(f"Loaded rng from {remote_extra_state_path}", rank=self.rank, logger=logger)
 
-        for module, module_state in zip(self._wrapped_models, model_states):
-            self._load_model_state(module, module_state)
-
-        optimizer_states = payload.get("optimizers", [])
-        if len(optimizer_states) != len(self._optimizers):
-            raise RuntimeError(
-                "Mismatch between saved optimizer count and registered optimizers:"
-                f" {len(optimizer_states)} vs {len(self._optimizers)}"
-            )
-        for optimizer, optimizer_state in zip(self._optimizers, optimizer_states):
-            optimizer.load_state_dict(optimizer_state)
-
-        scheduler_states = payload.get("lr_schedulers", [])
-        if len(scheduler_states) != len(self._lr_schedulers):
-            raise RuntimeError(
-                "Mismatch between saved LR scheduler count and registered schedulers:"
-                f" {len(scheduler_states)} vs {len(self._lr_schedulers)}"
-            )
-        for scheduler, scheduler_state in zip(self._lr_schedulers, scheduler_states):
-            scheduler.load_state_dict(scheduler_state)
+            lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
+            if lr_scheduler_state_dict is not None and lr_scheduler is not None:
+                lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+                log_with_rank(f"Loaded lr_scheduler from {remote_extra_state_path}", rank=self.rank, logger=logger)
 
         self.wait_for_everyone()
+
+        if self.fsdp_config.offload_params:
+            offload_fsdp_model_to_cpu(model)
+        if self.fsdp_config.offload_optimizer:
+            offload_fsdp_optimizer(optimizer)
+
+    def save_state(self, model: FSDP, optimizer: Optimizer, lr_scheduler: LRScheduler, local_path: str):
+        if local_path is None:
+            return
+
+        if self.fsdp_config.offload_params:
+            load_fsdp_model_to_gpu(model)
+        if self.fsdp_config.offload_optimizer:
+            load_fsdp_optimizer(optimizer, device_id=get_device_id())
+            
+        local_path = local_mkdir_safe(local_path)
+        self.wait_for_everyone()
+
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+        optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+                model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+                optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
+                extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
+
+                if 'model' in self.checkpoint_config.save_contents:    
+                    model_state_dict = model.state_dict()
+                    torch.save(model_state_dict, model_path)
+                    log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
         
-        # Load LoRA adapter if enabled
-        if self._is_lora:
-            self._load_lora_adapter(checkpoint_path)
+                if 'optimizer' in self.checkpoint_config.save_contents:
+                    optimizer_state_dict = optimizer.state_dict()
+                    torch.save(optimizer_state_dict, optim_path)
+                    log_with_rank(f"Saved optim to {os.path.abspath(optim_path)}", rank=self.rank, logger=logger)
 
-    def save_state(self, checkpoint_path: str):
-        """Persist model/optimizer/scheduler states to ``checkpoint_path``."""
-        if not self._wrapped_models:
-            raise RuntimeError("No models have been prepared with FSDP. Call prepare(model) before save_state().")
-
-        os.makedirs(checkpoint_path, exist_ok=True)
-
-        payload = {
-            "models": [self._gather_model_state(module) for module in self._wrapped_models],
-            "optimizers": [optimizer.state_dict() for optimizer in self._optimizers],
-            "lr_schedulers": [scheduler.state_dict() for scheduler in self._lr_schedulers],
-        }
-
-        if self.is_main_process:
-            state_file = os.path.join(checkpoint_path, self._state_filename)
-            torch.save(payload, state_file)
+                if 'extra' in self.checkpoint_config.save_contents:
+                    lr_scheduler_state_dict = lr_scheduler.state_dict() if lr_scheduler is not None else None
+                    extra_state_dict = {
+                        "lr_scheduler": lr_scheduler_state_dict,
+                        "rng": BaseCheckpointManager.get_rng_state(),
+                    }
+                    torch.save(extra_state_dict, extra_path)
+                    log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
 
         self.wait_for_everyone()
-        
-        # Save LoRA adapter if enabled
-        if self._is_lora:
-            self._save_lora_adapter(checkpoint_path)
+
+        if self.fsdp_config.offload_params:
+            offload_fsdp_model_to_cpu(model)
+        if self.fsdp_config.offload_optimizer:
+            offload_fsdp_optimizer(optimizer)
 
     def backward(self, loss: torch.Tensor):
-        # FSDP handles parameter offload automatically
-        # We only manage optimizer offload if configured
-        if self._offload_optimizer:
-            for manager in self._offload_managers:
-                manager.load_optimizers()
-        
         loss.backward()
+
+    def clip_grad_norm_(self, model: FSDP, max_norm: float):
+        grad_norm = model.clip_grad_norm_(max_norm)
+
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
         
-        if self._offload_optimizer:
-            for manager in self._offload_managers:
-                manager.offload_optimizers()
-
-    def clip_grad_norm_(self, parameters, max_norm: float):
-        # FSDP handles parameter/gradient access automatically
-        # No need to manually load/offload
-        if parameters is None:
-            if not self._wrapped_models:
-                result = torch.tensor(0.0, device=self._default_device())
-            else:
-                norms = []
-                for module in self._wrapped_models:
-                    norm = module.clip_grad_norm_(max_norm)
-                    norms.append(self._ensure_tensor(norm))
-                result = torch.stack(norms).max()
-        else:
-            if isinstance(parameters, nn.Module):
-                parameters = parameters.parameters()
-
-            if isinstance(parameters, (list, tuple)):
-                iterable: Iterable[torch.Tensor] = parameters
-            else:
-                iterable = list(parameters)
-
-            result = torch.nn.utils.clip_grad_norm_(iterable, max_norm)
-            result = self._ensure_tensor(result)
-        
-        return result
+        return grad_norm
 
     def get_model_weights(self, model=None):
         """Iterate over ``(name, tensor)`` pairs of CPU tensors.
@@ -410,7 +278,7 @@ class FSDPAccelerator(TrainEngine):
         engines—downstream consumers can iterate once and ship the tensors
         without loading the entire state dict into memory.
         """
-        target_model = model or (self._wrapped_models[0] if self._wrapped_models else None)
+        target_model = model or (self.wrapped_models[0] if self.wrapped_models else None)
         if target_model is None:
             raise RuntimeError("No model available to extract weights from. Call prepare(model) first or pass a model.")
 
@@ -424,187 +292,98 @@ class FSDPAccelerator(TrainEngine):
 
         return _state_dict()
 
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
-    def _build_mixed_precision_config(self) -> Optional[Dict[str, torch.dtype]]:
-        mp_param = getattr(self.fsdp_config, "mp_param_dtype", None)
-        mp_reduce = getattr(self.fsdp_config, "mp_reduce_dtype", None)
-        mp_buffer = getattr(self.fsdp_config, "mp_buffer_dtype", None)
-        if not any([mp_param, mp_reduce, mp_buffer]):
-            return None
-        return {
-            "param_dtype": _resolve_torch_dtype(mp_param, torch.bfloat16),
-            "reduce_dtype": _resolve_torch_dtype(mp_reduce, torch.float32),
-            "buffer_dtype": _resolve_torch_dtype(mp_buffer, torch.float32),
-        }
-
-    def _build_cpu_offload_config(self) -> Optional[Any]:
-        enable_cpu_offload = getattr(self.fsdp_config, "enable_cpu_offload", False)
-        if not enable_cpu_offload or CPUOffload is None:
-            return None
-        return CPUOffload(offload_params=True)
-
-    def _prepare_item(self, obj: Any):
+    def _prepare_item(self, obj: Any, **kwargs: Any):
         if isinstance(obj, nn.Module):
-            return self._prepare_module(obj)
+            return self._prepare_module(obj, **kwargs)
         if isinstance(obj, Optimizer):
-            self._register_optimizer(obj)
+            self._register_optimizer(obj, **kwargs)
             return obj
         if isinstance(obj, LRScheduler):
-            self._register_lr_scheduler(obj)
+            self._register_lr_scheduler(obj, **kwargs)
             return obj
         return obj
 
-    def _prepare_module(self, module: nn.Module):
-        if FullyShardedDataParallel is None:
-            raise RuntimeError("torch.distributed.fsdp is not available in this environment.")
+    def _prepare_module(self, module: nn.Module, **kwargs: Any):
+        from torch.distributed.fsdp import MixedPrecision, CPUOffload
+        from rllava.utils.torch_dtypes import PrecisionType
 
-        # Apply LoRA if configured and not already a PeftModel
-        if self._is_lora:
-            # Check if module is already a PeftModel (to avoid double application)
-            is_peft_model = hasattr(module, "peft_config") and hasattr(module, "base_model")
-            if not is_peft_model:
-                module = self._apply_lora(module)
-            elif self.is_main_process:
-                print("Model is already a PeftModel, skipping LoRA application in FSDP")
+        self.wait_for_everyone()
 
-        fsdp_kwargs: Dict[str, Any] = {
-            "use_orig_params": self._use_orig_params,
-        }
-        
-        # Add param_init_fn to handle meta tensor materialization
-        # This is critical for reducing peak memory usage when using meta tensor initialization
-        def param_init_fn(sub_module: nn.Module) -> nn.Module:
-            """
-            Initialize parameters for FSDP, converting meta tensors to empty tensors on GPU.
-            
-            This function is called by FSDP during initialization to materialize meta tensors
-            on non-rank-0 processes. By using to_empty(), we avoid loading full weights to GPU
-            before sharding, significantly reducing peak memory usage.
-            
-            Mimics verl's init_fn from fsdp_utils.py
-            """
-            if dist.is_initialized() and dist.get_rank() != 0:
-                device_id = self._infer_device_id()
-                if device_id is not None:
-                    device = torch.device("cuda", device_id)
-                    sub_module = sub_module.to_empty(device=device, recurse=False)
-                    torch.cuda.empty_cache()
-            return sub_module
-        
-        fsdp_kwargs["param_init_fn"] = param_init_fn
-        
-        # Enable sync_module_states to broadcast weights from rank 0 to other ranks
-        # This works together with param_init_fn and meta tensor initialization:
-        # - rank 0: loads full weights on CPU
-        # - rank != 0: has meta tensors materialized to empty tensors by param_init_fn
-        # - sync_module_states=True: FSDP broadcasts rank 0's weights to all other ranks
-        fsdp_kwargs["sync_module_states"] = True
+        forward_only = kwargs.get("forward_only", False)
 
-        # Add auto_wrap_policy to handle large models layer-by-layer
-        # This is CRITICAL for avoiding OOM on rank 0 during FSDP initialization
-        # Without this, FSDP tries to process the entire model at once, causing peak memory issues
-        auto_wrap_policy = self._get_auto_wrap_policy(module)
-        if auto_wrap_policy is not None:
-            fsdp_kwargs["auto_wrap_policy"] = auto_wrap_policy
-
-        if self._mixed_precision_config and MixedPrecision is not None:
-            fsdp_kwargs["mixed_precision"] = MixedPrecision(**self._mixed_precision_config)
-
-        if self._cpu_offload_config is not None:
-            fsdp_kwargs["cpu_offload"] = self._cpu_offload_config
-
-        if getattr(self.fsdp_config, "enable_full_shard", True) is False and ShardingStrategy is not None:
-            fsdp_kwargs["sharding_strategy"] = ShardingStrategy.SHARD_GRAD_OP
+        mixed_precision_config = self.fsdp_config.mixed_precision
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            # Explicitly set FULL_SHARD as default sharding strategy
-            if ShardingStrategy is not None:
-                fsdp_kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        device_id = self._infer_device_id()
-        if device_id is not None:
-            fsdp_kwargs["device_id"] = device_id
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=module,
+            config=self.fsdp_config.wrap_policy,
+            is_lora=self.config.model.use_peft
+        )
 
-        wrapped_module = FullyShardedDataParallel(module, **fsdp_kwargs)
-        self._wrapped_models.append(wrapped_module)
-        
-        # Register offload manager for optimizer offload only
-        # FSDP handles parameter offload internally via cpu_offload config
-        if self._offload_optimizer:
-            self._register_offload_manager(wrapped_module)
-        
-        return wrapped_module
-    
-    def _get_auto_wrap_policy(self, module: nn.Module):
-        """
-        Get auto wrap policy for FSDP to handle large models layer-by-layer.
-        
-        This prevents OOM by wrapping each transformer layer separately, so FSDP
-        can process and shard them one at a time instead of loading the entire model.
-        
-        Mimics verl's get_fsdp_wrap_policy implementation.
-        """
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, size_based_auto_wrap_policy
-        from functools import partial
-        from transformers.trainer_pt_utils import get_module_class_from_name
-        
-        # First, try to use the model's _no_split_modules attribute
-        # This is the standard HuggingFace way to define which layers should not be split
-        default_transformer_cls_names = getattr(module, "_no_split_modules", None)
-        
-        if default_transformer_cls_names:
-            # Use the model's own definition of transformer layers
-            transformer_cls_to_wrap = set()
-            for layer_class_name in default_transformer_cls_names:
-                transformer_cls = get_module_class_from_name(module, layer_class_name)
-                if transformer_cls is not None:
-                    transformer_cls_to_wrap.add(transformer_cls)
-            
-            if transformer_cls_to_wrap:
-                if self.rank == 0:
-                    print(f"[FSDP] Using transformer_auto_wrap_policy with layers from _no_split_modules: {transformer_cls_to_wrap}")
-                return partial(
-                    transformer_auto_wrap_policy,
-                    transformer_layer_cls=transformer_cls_to_wrap,
-                )
-        
-        # Fallback: manually detect common transformer layer classes
-        transformer_layer_cls = set()
-        layer_class_names = [
-            "Qwen2VLDecoderLayer",
-            "Qwen2DecoderLayer",
-            "LlamaDecoderLayer",
-            "MistralDecoderLayer",
-            "GPT2Block",
-            "BertLayer",
-            "T5Block",
-        ]
-        
-        for sub_module in module.modules():
-            module_class_name = sub_module.__class__.__name__
-            if module_class_name in layer_class_names:
-                transformer_layer_cls.add(sub_module.__class__)
-        
-        if transformer_layer_cls:
-            if self.rank == 0:
-                print(f"[FSDP] Using transformer_auto_wrap_policy with manually detected layers: {transformer_layer_cls}")
-            return partial(
-                transformer_auto_wrap_policy,
-                transformer_layer_cls=transformer_layer_cls,
+        cpu_offload = None
+        if forward_only:
+            cpu_offload = CPUOffload(offload_params=True)
+
+        sharding_strategy = get_sharding_strategy(self.device_mesh)
+        wrapped_module = FSDP(
+                module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,  # zero3
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                use_orig_params=self.fsdp_config.use_orig_params,
+                forward_prefetch=self.fsdp_config.forward_prefetch
             )
-        
-        # Final fallback: use size-based wrapping
-        # Wrap modules with >= 100M parameters
-        if self.rank == 0:
-            print("[FSDP] Using size_based_auto_wrap_policy with min_num_params=100M")
-        
-        return partial(size_based_auto_wrap_policy, min_num_params=100_000_000)
 
-    def _infer_device_id(self) -> Optional[int]:
-        if torch.cuda.is_available():
-            return torch.cuda.current_device()
-        return None
+        if wrapped_module not in self.wrapped_models:
+            self.wrapped_models.append(wrapped_module)
+
+        if self.config.model.enable_activation_offload:
+            enable_gradient_checkpointing = self.config.model.enable_gradient_checkpointing
+            enable_activation_offloading(wrapped_module, 'fsdp', enable_gradient_checkpointing)
+
+        if self.world_size == 1:
+            FSDP.set_state_dict_type(
+                wrapped_module,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        else:
+            FSDP.set_state_dict_type(
+                wrapped_module,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+
+        if not forward_only:
+            if self.fsdp_config.offload_params:
+                offload_fsdp_model_to_cpu(wrapped_module)
+                log_gpu_memory_usage("After offload model during init", logger=logger)
+
+        return wrapped_module
+
+    def _register_optimizer(self, optimizer: Optimizer, **kwargs: Any) -> None:
+        if optimizer not in self.optimizers:
+            self.optimizers.append(optimizer)
+            if self.fsdp_config.offload_optimizer:
+                offload_fsdp_optimizer(optimizer=optimizer)
+                log_gpu_memory_usage("After offload optimizer during init", logger=logger)
+
+    def _register_lr_scheduler(self, scheduler: LRScheduler, **kwargs: Any) -> None:
+        if scheduler not in self.lr_schedulers:
+            self.lr_schedulers.append(scheduler)
 
     def _default_device(self) -> torch.device:
         if torch.cuda.is_available():
@@ -616,43 +395,13 @@ class FSDPAccelerator(TrainEngine):
             return value.to(self._default_device())
         return torch.tensor(value, device=self._default_device())
 
-    def _register_optimizer(self, optimizer: Optimizer) -> None:
-        if optimizer not in self._optimizers:
-            self._optimizers.append(optimizer)
-            # Offload optimizer if configured and manager exists
-            if self._offload_optimizer:
-                for manager in self._offload_managers:
-                    manager.offload_optimizers()
-
-    def _register_lr_scheduler(self, scheduler: LRScheduler) -> None:
-        if scheduler not in self._lr_schedulers:
-            self._lr_schedulers.append(scheduler)
-
-    def _register_offload_manager(self, module: nn.Module) -> None:
-        # Only create manager for optimizer offload
-        # Parameter offload is handled by FSDP's built-in cpu_offload
-        manager = _FSDPOffloadManager(
-            module,
-            self._optimizers,
-            grad_offload=False,  # Disable grad offload, let FSDP handle it
-            optim_offload=self._offload_optimizer,
-        )
-        self._offload_managers.append(manager)
-        # Don't offload parameters here - FSDP will handle it
-        # Only offload optimizer if configured
-        if self._offload_optimizer:
-            manager.offload_optimizers()
-
     def _gather_model_state(self, module: nn.Module) -> Dict[str, torch.Tensor]:
         """Gather a full state dict on CPU regardless of local sharding.
         
         This method must be called synchronously on all ranks to avoid deadlocks.
         """
-        if isinstance(module, FullyShardedDataParallel):
+        if isinstance(module, FSDP):
             # Use FSDP's recommended state_dict API
-            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            
             # rank0_only=False ensures all ranks get the full state dict
             # This is needed when multiple ranks may call state_dict() independently (e.g., vLLM)
             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
@@ -665,235 +414,713 @@ class FSDPAccelerator(TrainEngine):
 
     def _load_model_state(self, module: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
         """Load a CPU state dict into a (possibly sharded) module."""
-        if isinstance(module, FullyShardedDataParallel):
-            with FullyShardedDataParallel.summon_full_params(module, recurse=True):
+        if isinstance(module, FSDP):
+            with FSDP.summon_full_params(module, recurse=True):
                 module.load_state_dict(state_dict)
         else:
             module.load_state_dict(state_dict)
         # FSDP will handle parameter offload automatically after loading
-    
-    # -------------------------------------------------------------------------
-    # LoRA utilities
-    # -------------------------------------------------------------------------
-    def _apply_lora(self, module: nn.Module) -> nn.Module:
-        """Apply LoRA to the module.
-        
-        Args:
-            module: The module to apply LoRA to
-            
-        Returns:
-            The module with LoRA applied (PeftModel)
-        """
-        try:
-            from peft import LoraConfig, TaskType, get_peft_model
-        except ImportError:
-            raise ImportError("peft library is required for LoRA. Install it with: pip install peft")
-        
-        if self._lora_config is None:
-            raise ValueError("LoRA is enabled but lora_config is not set")
-        
-        if self.is_main_process:
-            print("Applying LoRA to module")
-        
-        # Enable gradient computation for input embeddings if needed
-        module.enable_input_require_grads()
-        
-        # Prepare LoRA configuration
-        lora_config_dict = {
-            "task_type": TaskType.CAUSAL_LM,
-            "r": self._lora_config["lora_rank"],
-            "lora_alpha": self._lora_config["lora_alpha"],
-            "bias": "none",
-        }
-        
-        if self._lora_config["target_modules"] is not None:
-            lora_config_dict["target_modules"] = self._lora_config["target_modules"]
-        
-        if self._lora_config["exclude_modules"] is not None:
-            lora_config_dict["exclude_modules"] = self._lora_config["exclude_modules"]
-        
-        lora_config = LoraConfig(**lora_config_dict)
-        module = get_peft_model(module, lora_config)
-        
-        if self.is_main_process:
-            print(f"LoRA applied: r={self._lora_config['lora_rank']}, alpha={self._lora_config['lora_alpha']}")
-            module.print_trainable_parameters()
-        
-        return module
-    
-    def get_lora_weights(self, model=None) -> Optional[Dict[str, torch.Tensor]]:
-        """Get LoRA adapter weights from the model.
-        
-        Args:
-            model: The model to extract LoRA weights from. If None, uses the first wrapped model.
-            
-        Returns:
-            Dictionary of LoRA weights, or None if LoRA is not enabled
-        """
-        if not self._is_lora:
-            return None
-        
-        target_model = model or (self._wrapped_models[0] if self._wrapped_models else None)
-        if target_model is None:
-            raise RuntimeError("No model available to extract LoRA weights from")
-        
-        # Check if the model is a PeftModel
-        unwrapped = self.unwrap_model(target_model)
-        if not hasattr(unwrapped, "peft_config"):
-            return None
-        
-        try:
-            from peft.utils.save_and_load import get_peft_model_state_dict
-            
-            if isinstance(target_model, FullyShardedDataParallel):
-                # Use FSDP's state_dict API to gather LoRA parameters
-                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-                
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-                with FullyShardedDataParallel.state_dict_type(
-                    target_model, StateDictType.FULL_STATE_DICT, save_policy
-                ):
-                    full_state_dict = target_model.state_dict()
-                    # Extract only LoRA parameters
-                    lora_state_dict = get_peft_model_state_dict(unwrapped, state_dict=full_state_dict)
+
+
+class FSDPParameterFilter:
+    def __init__(self):
+        self.model_parameters_storage = set()
+
+    def __call__(self, tensor):
+        return tensor.untyped_storage().data_ptr() not in self.model_parameters_storage
+
+    def update_model_parameters(self, model):
+        new_storage = set()
+        for p in model.parameters():
+            new_storage.add(p.data.untyped_storage().data_ptr())
+        self.model_parameters_storage = new_storage
+
+
+class ActivationHandler:
+    def __init__(self, offload_ctx, sync_func, tensor_filter, enable_ckpt):
+        self._offload_ctx = offload_ctx
+        self._sync_func = sync_func
+        self._enable_ckpt = enable_ckpt
+        self._tensor_filter = tensor_filter
+        if enable_ckpt:
+            self.checkpoint_fn = functools.partial(
+                torch.utils.checkpoint.checkpoint,
+                use_reentrant=True,
+            )
+
+    def pre_forward(self, module):
+        if module.training:
+            self._offload_ctx.__enter__()
+            self._tensor_filter.update_model_parameters(module)
+
+    def post_forward(self, module):
+        if module.training:
+            self._offload_ctx.__exit__(None, None, None)
+
+    def _pack_kwargs(self, *args, **kwargs):
+        kwarg_keys = []
+        flat_args = list(args)
+        for k, v in kwargs.items():
+            kwarg_keys.append(k)
+            flat_args.append(v)
+
+        return tuple(flat_args), tuple(kwarg_keys)
+
+    def _unpack_kwargs(self, flat_args, kwarg_keys):
+        assert len(kwarg_keys) <= len(flat_args), f"too many keys {len(kwarg_keys)} vs. {len(flat_args)}"
+        if len(kwarg_keys) == 0:
+            return flat_args, {}
+        args = flat_args[: -len(kwarg_keys)]
+        kwargs = dict(zip(kwarg_keys, flat_args[-len(kwarg_keys) :], strict=True))
+        return args, kwargs
+
+    def _ckpt_forward(self, forward_method, *args, **kwargs):
+        flat_args, kwarg_keys = self._pack_kwargs(*args, **kwargs)
+
+        def my_function(*inputs):
+            # unpack back into args and kwargs
+            nonlocal forward_method, kwarg_keys
+            unpacked_args, unpacked_kwargs = self._unpack_kwargs(inputs, kwarg_keys)
+            # run original module
+            return forward_method(*unpacked_args, **unpacked_kwargs)
+
+        return self.checkpoint_fn(
+            my_function,
+            *flat_args,
+        )
+
+    def forward(self, module, forward_method, *args, **kwargs):
+        if not module.training:
+            return forward_method(*args, **kwargs)
+        if not self._enable_ckpt:
+            ret = forward_method(*args, **kwargs)
+        else:
+            ret = self._ckpt_forward(forward_method, *args, **kwargs)
+        binded_tensor = ret
+        if isinstance(ret, tuple):
+            binded_tensor = ret[0]
+        binded_tensor = self._sync_func(binded_tensor)
+        final_ret = binded_tensor
+        if isinstance(ret, tuple):
+            final_ret = (final_ret,) + ret[1:]
+        return final_ret
+
+    def wrap_module_forward_method(self, module):
+        orig_method = module.forward
+        handler = self
+
+        @functools.wraps(orig_method)
+        def wrapped_method(model_self, *args, **kwargs):
+            nonlocal handler
+            handler.pre_forward(model_self)
+            out = handler.forward(model_self, orig_method, *args, **kwargs)
+            handler.post_forward(model_self)
+            return out
+
+        module.forward = wrapped_method.__get__(module, type(module))
+
+
+class OffloadHandler:
+    """A base class for CPU offload-handler."""
+
+    def __init__(self) -> None:
+        pass
+
+    def tensor_push(self, tensor: torch.Tensor, **kwargs) -> Any:
+        """Tensor push."""
+        raise NotImplementedError(
+            "`tensor_push is not implented in OffloadHandler class. Inherit this class and implement your "
+            "custom tensor_push."
+        )
+
+    def tensor_pop(self, tensor_tag: Any, **kwargs):
+        """Tensor pop."""
+        raise NotImplementedError(
+            "`tensor_pop is not implented in OffloadHandler class. Inherit this class and implement your "
+            "custom tensor_pop."
+        )
+
+
+class GroupCommitFunction(torch.autograd.Function):
+    """this is a dummy op with output identical to input.
+    However, it is necessary for marking a timepoint for offload handler to
+    accomplish all synchronizations. Implementing it as a function is necessary
+    because we need to actions in both forward and backward.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, cpu_offload_handler):
+        # pylint: disable=missing-function-docstring
+        cpu_offload_handler.on_group_commit_forward()
+        ctx.cpu_offload_handler = cpu_offload_handler
+        # return the identical tensor
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # pylint: disable=missing-function-docstring
+        cpu_offload_handler = ctx.cpu_offload_handler
+        cpu_offload_handler.on_group_commit_backward()
+        return grad_output, None
+
+
+class CpuOffloadHookWithOffloadHandler:
+    """Context-manager that offloads/recovers tensors through an offload hander.
+
+    The hook just offloads/recovers the tensor object to the handler through `tensor_push`
+    and `tensor_pop` interface. How the offload-handler manages the offloading, recovering
+    or prefetching timing is transparent to this hook.
+    """
+
+    def __init__(
+        self,
+        offload_handler: OffloadHandler,
+        handler_extra_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if handler_extra_kwargs is None:
+            handler_extra_kwargs = {}
+        self.offload_handler: OffloadHandler = offload_handler
+        self.handler_extra_kwargs: dict[str, Any] = handler_extra_kwargs
+        self.inside_context = False
+
+    def __enter__(self):
+        self.inside_context = True
+        torch._C._autograd._push_saved_tensors_default_hooks(self.on_save_for_backward, self.on_get_saved_tensor)
+
+    def __exit__(self, *args: Any):
+        self.inside_context = False
+        torch._C._autograd._pop_saved_tensors_default_hooks()
+
+    def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
+        retrieve_identifier = self.offload_handler.tensor_push(tensor, **self.handler_extra_kwargs)
+        return retrieve_identifier
+
+    def on_get_saved_tensor(self, saved_state: Any) -> torch.Tensor:
+        tensor = self.offload_handler.tensor_pop(saved_state, **self.handler_extra_kwargs)
+        return tensor
+
+
+class SynchronizedGroupOffloadHandler(OffloadHandler):
+    """Offload Handler that offloads/reloads in a synchronized way.
+    The device-to-host and host-to-device copying happen in the same stream
+    as the computation kernels, thus the copying will block computation.
+    """
+
+    def __init__(self, num_offload_group, tensor_need_offloading_checker=(lambda _: True)) -> None:
+        super().__init__()
+
+        self.num_offload_group = num_offload_group
+        self.tensor_need_offloading_checker = tensor_need_offloading_checker
+
+        self.groupid_reset()
+
+    def groupid_reset(self):
+        """Groupid reset."""
+        # Data structures to label saved tensors and book-keep their cpu copies.
+        # Currently, on push, create a new cpu tensor and copies; on pop, copies
+        # the tensor back to gpu and deletes the cpu tensor.
+        # These will increment whenever `group_commit()` is invoked
+        self.current_group, self.tensor_count_current_group = (0, 0)
+        self.torch_tensor_count = 0
+        self.tensor_tag_to_state = {}
+
+    def on_group_commit_forward(self):
+        """On group commit forward."""
+        # finishing up with updating current group and tensor count
+        self.current_group += 1  # increment
+        self.tensor_count_current_group = 0  # reset
+
+    def on_group_commit_backward(self):
+        """On group commit backward."""
+        self.current_group -= 1
+        assert self.current_group >= 0
+
+    @staticmethod
+    def offload(src_tensor, pin_memory=True):
+        """Offload."""
+
+        cpu_backup = torch.empty(
+            src_tensor.size(),
+            dtype=src_tensor.dtype,
+            layout=src_tensor.layout,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        cpu_backup.copy_(src_tensor, non_blocking=True)
+        state = (src_tensor.device, cpu_backup)
+        return state
+
+    @staticmethod
+    def reload(state, non_blocking=None):
+        """Reload."""
+        dev, cpu_backup = state
+        if non_blocking is None:
+            non_blocking = cpu_backup.is_pinned()
+        return cpu_backup.to(dev, non_blocking=non_blocking)
+
+    def tensor_push(self, tensor: torch.Tensor, **kwargs):
+        """Tensor push."""
+        # obtain a unique tensor tag
+        tensor_tag = (self.current_group, self.tensor_count_current_group)
+        self.tensor_count_current_group += 1
+        assert tensor_tag not in self.tensor_tag_to_state
+        if self.current_group < self.num_offload_group and self.tensor_need_offloading_checker(tensor):
+            state = SynchronizedGroupOffloadHandler.offload(tensor)
+            self.tensor_tag_to_state[tensor_tag] = state
+        else:
+            # will be offloaded together after group commit
+            self.tensor_tag_to_state[tensor_tag] = tensor
+
+        return tensor_tag
+
+    def tensor_pop(self, tensor_tag, **kwargs):
+        """Tensor pop."""
+        assert tensor_tag in self.tensor_tag_to_state
+        state = self.tensor_tag_to_state.pop(tensor_tag)
+        if isinstance(state, tuple):
+            tensor = SynchronizedGroupOffloadHandler.reload(state)
+        else:
+            tensor = state
+        return tensor
+
+
+class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
+    """Compared to synchronize, this uses more memory because of the buffer but
+    achieves better performance due to the overlapping. D2h and h2d copying are
+    completely hidden behind computation if computation time of a layer is longer
+    than host-device communication time. Bulk offloading with delay and bulk reloading
+    with prefetch are implemented."""
+
+    def __init__(
+        self,
+        num_offload_group,  # must be <= actual number of groups (number of commits)
+        num_model_group,
+        tensor_need_offloading_checker=(lambda t: True),
+    ) -> None:
+        super().__init__(
+            num_offload_group=num_offload_group,
+            tensor_need_offloading_checker=tensor_need_offloading_checker,
+        )
+        # Number of layers in the model
+        self.num_layers = num_model_group
+        # Data Structure to maintain reference to activation tensors
+        self.tensor_tag_to_buf = {}
+        # Tracking the number of layers offloaded
+        self.offloaded_group_count = 0
+        # Core data structure that decides the window for offloading
+        self.layer_window_map = {}
+        self.group_offload_mapping = {}
+
+        # Logic to make offloading load balance across computation
+        # for optimal CPU/GPU interconnect usage
+        constant = 0
+        for i in range(self.num_offload_group):
+            self.layer_window_map[i] = ((self.num_layers // self.num_offload_group) * (i + 1)) - 1
+            if i < (self.num_layers % self.num_offload_group):
+                self.layer_window_map[i] += i + 1
+                constant = i + 1
             else:
-                lora_state_dict = get_peft_model_state_dict(unwrapped)
-            
-            # Ensure all tensors are on CPU
-            lora_state_dict = {
-                k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-                for k, v in lora_state_dict.items()
-            }
-            
-            return lora_state_dict
-        except Exception as e:
-            if self.is_main_process:
-                print(f"Warning: Failed to extract LoRA weights: {e}")
-            return None
-    
-    def _save_lora_adapter(self, checkpoint_path: str):
-        """Save LoRA adapter weights and configuration.
-        
-        Args:
-            checkpoint_path: Directory to save the LoRA adapter
-        """
-        if not self._wrapped_models:
-            return
-        
-        lora_save_path = os.path.join(checkpoint_path, "lora_adapter")
-        
-        # Get the first wrapped model
-        target_model = self._wrapped_models[0]
-        unwrapped = self.unwrap_model(target_model)
-        
-        # Check if model has peft_config
-        if not hasattr(unwrapped, "peft_config"):
-            if self.is_main_process:
-                print("Warning: Model does not have peft_config, skipping LoRA adapter save")
-            return
-        
-        try:
-            # Save configuration on rank 0
-            peft_config_dict = {}
-            if self.is_main_process:
-                os.makedirs(lora_save_path, exist_ok=True)
-                
-                from dataclasses import asdict
-                peft_config = unwrapped.peft_config.get("default")
-                if peft_config:
-                    peft_config_dict = asdict(peft_config)
-                    # Convert enum values to strings
-                    if "task_type" in peft_config_dict and hasattr(peft_config_dict["task_type"], "value"):
-                        peft_config_dict["task_type"] = peft_config_dict["task_type"].value
-                    if "peft_type" in peft_config_dict and hasattr(peft_config_dict["peft_type"], "value"):
-                        peft_config_dict["peft_type"] = peft_config_dict["peft_type"].value
-                    if "target_modules" in peft_config_dict and isinstance(peft_config_dict["target_modules"], set):
-                        peft_config_dict["target_modules"] = list(peft_config_dict["target_modules"])
-            
-            # Get LoRA weights
-            lora_weights = self.get_lora_weights(target_model)
-            
-            if lora_weights and self.is_main_process:
-                # Save weights using safetensors
-                try:
-                    from safetensors.torch import save_file
-                    save_file(lora_weights, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                except ImportError:
-                    # Fallback to torch.save
-                    torch.save(lora_weights, os.path.join(lora_save_path, "adapter_model.bin"))
-                
-                # Save config
-                import json
-                with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                    json.dump(peft_config_dict, f, ensure_ascii=False, indent=4)
-                
-                print(f"LoRA adapter saved to: {lora_save_path}")
-        
-        except Exception as e:
-            if self.is_main_process:
-                print(f"Warning: Failed to save LoRA adapter: {e}")
-        
-        self.wait_for_everyone()
-    
-    def _load_lora_adapter(self, checkpoint_path: str):
-        """Load LoRA adapter weights and configuration.
-        
-        Args:
-            checkpoint_path: Directory containing the LoRA adapter
-        """
-        if not self._wrapped_models:
-            return
-        
-        lora_load_path = os.path.join(checkpoint_path, "lora_adapter")
-        
-        # Check if LoRA adapter exists
-        if not os.path.exists(lora_load_path):
-            if self.is_main_process:
-                print(f"LoRA adapter not found at {lora_load_path}, skipping load")
-            return
-        
-        # Get the first wrapped model
-        target_model = self._wrapped_models[0]
-        unwrapped = self.unwrap_model(target_model)
-        
-        # Check if model has peft_config
-        if not hasattr(unwrapped, "peft_config"):
-            if self.is_main_process:
-                print("Warning: Model does not have peft_config, skipping LoRA adapter load")
-            return
-        
-        try:
-            # Load LoRA weights
-            safetensors_path = os.path.join(lora_load_path, "adapter_model.safetensors")
-            bin_path = os.path.join(lora_load_path, "adapter_model.bin")
-            
-            if os.path.exists(safetensors_path):
-                from safetensors.torch import load_file
-                lora_weights = load_file(safetensors_path)
-            elif os.path.exists(bin_path):
-                lora_weights = torch.load(bin_path, map_location="cpu")
+                self.layer_window_map[i] += constant
+
+        # allocate streams and events for synchronization
+        self.d2h_stream = get_torch_device().Stream()
+        self.h2d_stream = get_torch_device().Stream()
+
+    def tensor_push(self, tensor: torch.Tensor, **kwargs) -> Any:
+        torch_stray_tensor = isinstance(
+            tensor,
+            torch._subclasses.fake_tensor.FakeTensor | torch._subclasses.functional_tensor.FunctionalTensor,
+        )
+        need_offload = not torch_stray_tensor
+        need_offload = need_offload and self.tensor_need_offloading_checker(tensor)
+
+        if need_offload:
+            # obtain a unique tensor tag
+            tensor_tag = (self.current_group, self.tensor_count_current_group)
+            self.tensor_count_current_group += 1
+
+            assert tensor_tag not in self.tensor_tag_to_state
+            self.tensor_tag_to_state[tensor_tag] = tensor
+
+            if self.current_group < self.num_offload_group:
+                self.tensor_tag_to_buf[tensor_tag] = tensor
+        else:
+            tensor_tag = tensor
+        return tensor_tag
+
+    def tensor_pop(self, tensor_tag, **kwargs):
+        """Tensor pop."""
+        if isinstance(tensor_tag, torch.Tensor):
+            return tensor_tag
+        assert tensor_tag in self.tensor_tag_to_state
+        tensor = self.tensor_tag_to_state.pop(tensor_tag)
+        self.tensor_tag_to_buf.pop(tensor_tag, None)
+
+        # the tensor should have been copied back in on_group_commit_backward()
+        # which invokes bulk_reload_group.
+        assert not isinstance(tensor, tuple)
+        return tensor
+
+    def bulk_offload_group(self, group_to_offload):
+        """Bulk offload group."""
+        offload_mapping = {}
+        offload_size = 0
+        with get_torch_device().stream(self.d2h_stream):
+            for tensor_tag, state in self.tensor_tag_to_state.items():
+                group_id, _ = tensor_tag
+                if group_id == group_to_offload:
+                    assert not isinstance(state, tuple)
+                    key = _get_unique_tensor_key(state)
+                    if key not in offload_mapping:
+                        offload_mapping[key] = state
+                    # if offload, return the reference to cpu copy
+                    self.tensor_tag_to_state[tensor_tag] = (key, state.shape)
+            for key, tensor in offload_mapping.items():
+                state = SynchronizedGroupOffloadHandler.offload(tensor)
+                offload_size += tensor.numel() * tensor.element_size()
+                offload_mapping[key] = state
+
+            self.group_offload_mapping[group_to_offload] = offload_mapping
+
+    def synchronize_on_group_commit_forward(self, current_group):
+        """Synchronize on group commit forward."""
+
+        # For the first group, kickstart the offload after we have
+        # the first compute completion
+        if current_group == 0:
+            self.d2h_stream.wait_stream(get_torch_device().current_stream())
+            self.bulk_offload_group(current_group)
+
+        # Window map data structure helps us synchronize based on number
+        # of layers offloaded
+        if self.layer_window_map[self.offloaded_group_count] == current_group:
+            # Stream synchronization both ways
+            self.d2h_stream.wait_stream(get_torch_device().current_stream())
+            get_torch_device().current_stream().wait_stream(self.d2h_stream)
+
+            # Time to free the activation memory after usage
+            for tensor_tag, _ in self.tensor_tag_to_buf.items():
+                if tensor_tag[0] == self.offloaded_group_count:
+                    self.tensor_tag_to_buf[tensor_tag] = None
+
+            # Time to offload the next group
+            if self.offloaded_group_count < (self.num_offload_group - 1):
+                self.bulk_offload_group(self.offloaded_group_count + 1)
+
+            # Increment the offload group count to keep track
+            self.offloaded_group_count += 1
+
+    def on_group_commit_forward(self):
+        """This function will cause host device synchronization"""
+        # handle synchronization events
+        self.synchronize_on_group_commit_forward(self.current_group)
+
+        super().on_group_commit_forward()
+
+    @torch.no_grad
+    def bulk_reload_group(self, group_to_reload):
+        """Bulk reload group."""
+        assert group_to_reload < self.num_offload_group
+
+        with get_torch_device().stream(self.h2d_stream):
+            # move back tensors
+            offload_mapping = self.group_offload_mapping.pop(group_to_reload)
+            assert offload_mapping is not None
+            for key, state in offload_mapping.items():
+                offload_mapping[key] = SynchronizedGroupOffloadHandler.reload(state)
+            for tensor_label, state in self.tensor_tag_to_state.items():
+                group_id, _ = tensor_label
+                if group_id == group_to_reload and not isinstance(state, torch.Tensor):
+                    assert isinstance(state, tuple), f"{group_id} {state}"
+                    key, shape = state
+                    recovered_tensor = offload_mapping[key].view(shape)
+                    self.tensor_tag_to_state[tensor_label] = recovered_tensor
+
+    def on_group_commit_backward(self):
+        # first decrement the current group.
+        # after last commit in forward, the group will +1; in backward it -1.
+        # Finally it should be decremented to 0.
+        self.current_group -= 1
+        assert self.current_group >= 0
+
+        # Layer window data structure helps us to reload at right times
+        if self.layer_window_map[self.offloaded_group_count - 1] == self.current_group:
+            # Stream synchronization both ways
+            self.h2d_stream.wait_stream(get_torch_device().current_stream())
+            get_torch_device().current_stream().wait_stream(self.h2d_stream)
+
+            # Time to reload the next group
+            self.bulk_reload_group(self.offloaded_group_count - 1)
+
+            # Decrease the offloading group counter
+            self.offloaded_group_count -= 1 if self.offloaded_group_count > 1 else 0
+
+        # Last group computation needs to wait till all the reloads complete
+        if self.current_group == 0:
+            get_torch_device().current_stream().wait_stream(self.h2d_stream)
+            self.offloaded_group_count = 0
+
+
+group_prefetch_offload_commit = GroupCommitFunction.apply
+
+
+def _get_unique_tensor_key(tensor):
+    key = (tensor.untyped_storage().data_ptr() + tensor.storage_offset(), tensor.dtype)
+    return key
+
+# Copyright 2020-present the HuggingFace Inc. team.
+# Adapted from https://github.com/huggingface/transformers/src/transformers/trainer.py
+def get_fsdp_wrap_policy(module, config=None, is_lora=False):
+    """Get FSDP wrap policy for the module.
+
+    Args:
+        module: The module to get wrap policy for
+        config: Configuration for wrap policy
+        is_lora: Whether to enable lambda policy for LoRA modules
+    """
+    if config is None:
+        config = {}
+
+    # NOTE: This is a temporary workaround to be compatible with the OmegaConf & dataclass. We will remove this
+    # once we have make all config in verl from OmegaConf to data class.
+    def _get_attr(attr_name, default_value=None):
+        if hasattr(config, "get"):
+            return config.get(attr_name, default_value)
+        else:
+            return config.__getattribute__(attr_name)
+
+    if _get_attr("disable", False):
+        return None
+
+    default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
+    fsdp_transformer_layer_cls_to_wrap = _get_attr(
+        "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
+    )
+    min_num_params = _get_attr("min_num_params", 0)
+    auto_wrap_policy = None
+
+    policies = []
+
+    from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy
+
+    # Add lambda policy for LoRA modules if is_lora is True
+    if is_lora:
+
+        def lambda_policy_fn(module):
+            return bool(
+                len(list(module.named_children())) == 0
+                and getattr(module, "weight", None) is not None
+                and module.weight.requires_grad
+            )
+
+        lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+        policies.append(lambda_policy)
+
+    if min_num_params > 0:
+        size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+        policies.append(size_policy)
+    elif fsdp_transformer_layer_cls_to_wrap is not None:
+        transformer_cls_to_wrap = set()
+        for layer_class in fsdp_transformer_layer_cls_to_wrap:
+            transformer_cls = get_module_class_from_name(module, layer_class)
+            if transformer_cls is None:
+                raise Exception("Could not find the transformer layer class to wrap in the model.")
             else:
-                if self.is_main_process:
-                    print(f"Warning: LoRA weights not found in {lora_load_path}")
-                return
-            
-            # Load weights into model
-            if isinstance(target_model, FullyShardedDataParallel):
-                with FullyShardedDataParallel.summon_full_params(target_model, recurse=True):
-                    # Filter to only LoRA parameters
-                    current_state = target_model.state_dict()
-                    lora_state = {k: v for k, v in lora_weights.items() if k in current_state}
-                    target_model.load_state_dict(lora_state, strict=False)
+                transformer_cls_to_wrap.add(transformer_cls)
+
+        transformer_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=transformer_cls_to_wrap,
+        )
+        policies.append(transformer_policy)
+
+    if len(policies) > 0:
+        auto_wrap_policy = functools.partial(_or_policy, policies=policies)
+
+    return auto_wrap_policy
+
+def init_fn(x: torch.nn.Module):
+    if torch.distributed.get_rank() != 0:
+        x = x.to_empty(device=get_device_id(), recurse=False)
+        torch.cuda.empty_cache()
+    return x
+
+def get_activation_offload_context(
+    num_layers: int = 1, model_layers: int = 1, tensor_need_offloading_checker=(lambda t: True)
+):
+    cpu_offload_handler = AsyncDoubleBufferGroupOffloadHandler(
+        num_offload_group=num_layers,
+        num_model_group=model_layers,
+        tensor_need_offloading_checker=tensor_need_offloading_checker,
+    )
+
+    def group_prefetch_offload_commit_async(tensor):
+        return group_prefetch_offload_commit(tensor, cpu_offload_handler)
+
+    return (
+        CpuOffloadHookWithOffloadHandler(offload_handler=cpu_offload_handler),
+        group_prefetch_offload_commit_async,
+    )
+
+def enable_activation_offloading(model, enable_ckpt=False):
+    """
+    Enable activation offloading for the model. It groups activations by TransformerLayer and offloads activation
+    groups asynchronously. This means that the offloading of the i-th activation group and the computation of the i+1-th
+    activation group happen at the same time, and there are at most two activation groups in GPU memory.
+
+    Args:
+        model: the model to enable activation offloading
+        strategy: the training strategy of the model, such as "fsdp"
+        enable_ckpt: whether activation checkpointing(also called gradient checkpointing) has been enabled for the model
+
+    Note:
+        For best efficiency, activation offloading is usually combined with activation checkpointing. However, this
+        implementation of activation offloading is conflicted with the implementation of activation checkpointing in
+        some training strategies. This function resolves this conflict, and therefore requires the "strategy" and
+        "enable_ckpt" arguments.
+
+    Returns:
+
+    """
+
+    layers = []
+
+    def get_layers(module):
+        for name, child in module.named_children():
+            if not isinstance(child, FSDP):
+                get_layers(child)
             else:
-                current_state = target_model.state_dict()
-                lora_state = {k: v for k, v in lora_weights.items() if k in current_state}
-                target_model.load_state_dict(lora_state, strict=False)
-            
-            if self.is_main_process:
-                print(f"LoRA adapter loaded from: {lora_load_path}")
-        
-        except Exception as e:
-            if self.is_main_process:
-                print(f"Warning: Failed to load LoRA adapter: {e}")
-        
-        self.wait_for_everyone()
+                wrapped_module = child
+                if isinstance(child, FSDP):
+                    wrapped_module = child._fsdp_wrapped_module
+                # In some cases, torch.nn.Embedding is wrapped with FSDP alone. However, the activation
+                # size of torch.nn.Embedding is small, so it's not necessary to offload it.
+                if not isinstance(wrapped_module, torch.nn.Embedding):
+                    layers.append(child)
+
+    get_layers(model)
+    if len(layers) < 3:
+        logger.warning(f"Find only {len(layers)} fsdp layers, not neccessary to enable async activation offloading")
+        return
+
+    tensor_filter = FSDPParameterFilter()
+    context, sync_func = get_activation_offload_context(len(layers) - 1, len(layers), tensor_filter)
+    if enable_ckpt:
+        # The implementation of activation checkpointing in transformers library is incompatible with
+        # activation offloading,
+        # so it will be disabled, but this implementation supports another version of activation checkpointing, so that
+        # these two features can be enabled at the same time.
+        for module in model.modules():
+            if hasattr(module, "gradient_checkpointing_disable"):
+                module.gradient_checkpointing_disable()
+
+    handler = ActivationHandler(context, sync_func, tensor_filter, enable_ckpt)
+    for layer in layers:
+        module = layer
+        if isinstance(layer, FSDP):
+            module = module._fsdp_wrapped_module
+        handler.wrap_module_forward_method(module)
+
+@torch.no_grad()
+def load_fsdp_model_to_gpu(model: FSDP):
+    # lazy init FSDP model
+    _lazy_init(model, model)
+    assert model._is_root, "Only support root model loading to GPU"
+    device_id = get_device_id()
+    for handle in model._all_handles:
+        if handle._offload_params:
+            continue
+        flat_param = handle.flat_param
+        handle.flat_param_to(torch.device(f"{get_device_name()}:{device_id}"), non_blocking=True)
+        # the following still keeps id(._local_shard) != id(.data)
+        flat_param._local_shard = flat_param.data
+
+@torch.no_grad()
+def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
+    # lazy init FSDP model
+    _lazy_init(model, model)
+    assert model._is_root, "Only support root model offloading to CPU"
+    for handle in model._all_handles:
+        if handle._offload_params:
+            continue
+        flat_param = handle.flat_param
+        assert (
+            flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+            and id(flat_param.data) != id(flat_param._local_shard)
+            and flat_param.data.size() == flat_param._local_shard.size()
+        )
+        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+        # the following still keeps id(._local_shard) != id(.data)
+        flat_param._local_shard = flat_param.data
+        assert id(flat_param._local_shard) != id(flat_param.data)
+    if empty_cache:
+        get_torch_device().empty_cache()
+
+@torch.no_grad()
+def offload_fsdp_optimizer(optimizer):
+    if not optimizer.state:
+        return
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            state = optimizer.state[param]
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to("cpu", non_blocking=True)
+
+@torch.no_grad()
+def load_fsdp_optimizer(optimizer, device_id):
+    if not optimizer.state:
+        return
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            state = optimizer.state[param]
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device_id, non_blocking=True)
+
+def create_device_mesh(world_size, fsdp_size):
+    device_name = get_device_name()
+
+    if fsdp_size < 0 or fsdp_size >= world_size:
+        device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
+    else:
+        device_mesh = init_device_mesh(
+            device_name, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
+        )
+    return device_mesh
+
+def get_sharding_strategy(device_mesh):
+    from torch.distributed.fsdp import ShardingStrategy
+
+    if device_mesh.ndim == 1:
+        sharding_strategy = ShardingStrategy.FULL_SHARD
+    elif device_mesh.ndim == 2:
+        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    else:
+        raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
+    return sharding_strategy
+
+def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True, rank0_only: bool = True):
+    """
+    Get the full state dict from an FSDP model.
+
+    Args:
+        model (torch.nn.Module): The FSDP model to get state dict from
+        offload_to_cpu (bool, optional): Whether to offload the state dict to CPU. Defaults to True.
+        rank0_only (bool, optional): Whether to only get state dict on rank 0. Defaults to True.
+
+    Returns:
+        dict: The full state dict of the model
+
+    Raises:
+        NotImplementedError: If the FSDP version is unknown
+    """
+    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+    state_dict_config = FullStateDictConfig(offload_to_cpu=offload_to_cpu, rank0_only=rank0_only)
+    
+    with FSDP.state_dict_type(
+        model, state_type=StateDictType.FULL_STATE_DICT, state_cfg=state_dict_config, optim_cfg=None
+    ):
+        state_dict = model.state_dict()
+    return state_dict

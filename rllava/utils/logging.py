@@ -4,23 +4,11 @@ import sys
 
 import torch.distributed as dist
 
+from rllava.utils.logger.aggregate_logger import print_rank_0
 
 
 root_logger = None
 
-def print_rank(message: str):
-    """Print message only on rank 0."""
-    if dist.is_initialized():
-        print(">>>>>>>>>>>>>>>>>>>>", dist.get_rank(), message)
-    elif not dist.is_initialized():
-        print(message)
-
-def print_rank0(message: str):
-    """Print message only on rank 0."""
-    if dist.is_initialized() and dist.get_rank() == 0:
-        print(message)
-    elif not dist.is_initialized():
-        print(message)
 
 def logger_setting(save_dir=None, level=logging.INFO):
     global root_logger
@@ -53,9 +41,6 @@ def log(*args):
     if local_rank == 0:
         root_logger.info(*args)
 
-
-
-        
 def log_trainable_params(model):
     def _global_numel(param):
         ds_numel = getattr(param, "ds_numel", None)
@@ -74,4 +59,4 @@ def log_trainable_params(model):
     log(f'Trainable Parameters:')
     for name, param in model.named_parameters():
         if param.requires_grad:
-            print_rank0(f"{name}: {_global_numel(param)} parameters")
+            print_rank_0(f"{name}: {_global_numel(param)} parameters")

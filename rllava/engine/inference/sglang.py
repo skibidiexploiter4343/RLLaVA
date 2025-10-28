@@ -17,7 +17,7 @@ from .base import InferenceEngine
 from .. import register_engine
 from rllava.data.protocol import DataProto
 from rllava.utils import torch_functional as VF
-from .remote_utils import ServiceProcess, ensure_port, find_free_port
+# from .remote_utils import ServiceProcess, ensure_port, find_free_port
 from .config import SGLangConfig
 try:
     import sglang as sgl

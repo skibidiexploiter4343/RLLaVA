@@ -17,7 +17,7 @@ RLLaVA is a **flexible, production-ready framework** for applying reinforcement 
 Built upon TinyLLaVA's design philosophy of lightweight and extensible architecture, RLLaVA provides a powerful yet accessible platform for multimodal RL development.
 
 <div align="center">
-  <img src="assets/arch.png" alt="RLLaVA  Architecture" width="600">
+  <img src="assets/arch.png" alt="RLLaVA Architecture" width="600">
 </div>
 
 ---

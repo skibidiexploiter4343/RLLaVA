@@ -8,7 +8,7 @@ from trl import get_peft_config
 from peft import get_peft_model
 from ..config import CriticConfig
 from rllava.data.protocol import DataProto
-from rllava.utils.logging import print_rank0
+from rllava.utils.logger.aggregate_logger import print_rank_0
 from rllava.utils.torch_dtypes import PrecisionType
 from tqdm import tqdm
 from codetiming import Timer
@@ -18,11 +18,10 @@ from rllava.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice
 from rllava.utils.flops_counter import FlopsCounter
 from ..utils.core_algos import compute_value_loss
 from rllava.utils.py_functional import append_to_dict
-from rllava.engine import TrainEngine
+from rllava.engine import EngineFactory
 from rllava.utils.model_utils import print_model_size
 from rllava.utils.performance import log_gpu_memory_usage
 from rllava.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
-
 
 
 
@@ -37,15 +36,13 @@ logger.setLevel(os.getenv("RLLAVA_LOGGING_LEVEL", "WARN"))
 
 
 class Critic():
-    def __init__(self, config: CriticConfig, accelerator: TrainEngine):
+    def __init__(self, config: CriticConfig):
         self.config = config
-        # Initialize Accelerator for unified distributed training management
-        self.accelerator = accelerator
-        
-        # Model and training components - moved from worker to Actor class
         self.model = None
         self.optimizer = None
         self.lr_scheduler = None
+
+        self.accelerator = EngineFactory(config.strategy)(config)
 
     def initialize(self):
         self._init_model_and_optimizer(AutoModelForTokenClassification)
@@ -65,7 +62,7 @@ class Critic():
 
     def _init_model_and_optimizer(self, model_class):
         """Initialize model and optimizer directly in Actor class."""
-        print_rank0("Initializing model and optimizer in Actor class...")
+        print_rank_0("Initializing model and optimizer in Actor class...")
         
         # Load model
         torch_dtype = self.config.model.get("model_dtype", None)

@@ -26,7 +26,7 @@ def format_reward(response: str) -> float:
 
 def accuracy_reward(response: str, ground_truth: str) -> float:
     try:
-        content_match = re.search(r"<answer>(.*?)</answer>", response)
+        content_match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
         given_answer = content_match.group(1).strip() if content_match else response.strip()
         if grade_answer(given_answer, ground_truth.strip()):
             return 1.0

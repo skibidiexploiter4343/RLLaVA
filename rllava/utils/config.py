@@ -1,4 +1,5 @@
 import os
+import warnings
 from rllava.data.config import DataConfig
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple, List
@@ -101,6 +102,18 @@ class TrainerConfig:
                 print(f"Model checkpoint {self.load_checkpoint_path} not found.")
                 self.load_checkpoint_path = None
 
+
+@dataclass
+class BaseConfig:
+    data: DataConfig = field(default_factory=DataConfig)
+    trainer: TrainerConfig = field(default_factory=TrainerConfig)
+
+    def deep_post_init(self):
+        recursive_post_init(self)
+
+    def to_dict(self):
+        return asdict(self)
+
                 
 @dataclass
 class ModelConfig:
@@ -110,6 +123,7 @@ class ModelConfig:
     attn_implementation: Optional[str] = field(default='flash_attention_2')
     override_config: Dict[str, Any] = field(default_factory=dict)
     enable_gradient_checkpointing: bool = True
+    enable_activation_offload: bool = False
     trust_remote_code: bool = True
     freeze_vision_tower: bool = False
     use_peft: bool = field(
@@ -129,6 +143,7 @@ class ModelConfig:
     use_rslora: bool = field(default=False)
     tie_word_embeddings: bool = field(default=False)
     lora_modules_to_save: Optional[List[str]] = field(default=None)
+
     def post_init(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -190,6 +205,24 @@ class LLaVAModelConfig(ModelConfig):
 
 
 @dataclass
+class CheckpointConfig:
+    """Configuration for model checkpointing.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        save_contents (list[str]): What to include in saved checkpoints.
+            Options: 'model', 'optimizer', 'extra', 'hf_model'.
+        load_contents (list[str]): Contents to load from checkpoint. Defaults to same as save_contents.
+        async_save (bool): Whether to save checkpoints asynchronously. Only implemented for Megatron as of now.
+    """
+
+    save_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
+    load_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
+    async_save: bool = False
+
+
+@dataclass
 class OptimConfig:
     lr: float = 1e-6
     betas: Tuple[float, float] = (0.9, 0.999)
@@ -197,25 +230,35 @@ class OptimConfig:
     strategy: str = "adamw"
     lr_warmup_ratio: float = 0.0
     lr_warmup_steps: Optional[int] = None
+    lr_scheduler_type: str = "constant"
     min_lr_ratio: Optional[float] = None
+    num_cycles: float = 0.5
     warmup_style: str = "constant"
     # below are auto keys
     training_steps: int = field(default=-1, init=False)
 
+    def post_init(self):
+        if self.warmup_style is not None:
+            assert self.warmup_style in ["constant", "cosine"]
+            warnings.warn(
+                "`warmup_style` is deprecated, use `lr_scheduler_type` instead.", DeprecationWarning, stacklevel=2
+            )
+            self.lr_scheduler_type = self.warmup_style
+        assert self.lr_scheduler_type in ["constant", "cosine"]
+
 
 @dataclass
 class FSDPConfig:
-    enable_full_shard: bool = True
+    wrap_policy: dict[str, Any] = field(default_factory=dict)
     enable_cpu_offload: bool = False
     use_orig_params: bool = False
     torch_dtype: Optional[str] = None
     offload_params: bool = False
     offload_optimizer: bool = False
+    forward_prefetch: bool = False
     fsdp_size: int = -1
     ulysses_size: int = 1
-    mp_param_dtype: str = "bf16"
-    mp_reduce_dtype: str = "fp32"
-    mp_buffer_dtype: str = "fp32"
+    mixed_precision: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -225,15 +268,3 @@ class DeepSpeedConfig:
     enable_cpu_offload: bool = False
     use_orig_params: bool = False
     torch_dtype: Optional[str] = None
-
-
-@dataclass
-class BaseConfig:
-    data: DataConfig = field(default_factory=DataConfig)
-    trainer: TrainerConfig = field(default_factory=TrainerConfig)
-
-    def deep_post_init(self):
-        recursive_post_init(self)
-
-    def to_dict(self):
-        return asdict(self)

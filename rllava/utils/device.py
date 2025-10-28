@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 def is_torch_npu_available() -> bool:
     """Check the availability of NPU"""
     try:
-        import torch_npu  # noqa: F401
-
-        return torch.npu.is_available()
+        if hasattr(torch, "npu") and callable(getattr(torch.npu, "is_available", None)):
+            return torch.npu.is_available()
+        return False
     except ImportError:
         return False
 
@@ -55,3 +55,11 @@ def get_torch_device() -> any:
     except AttributeError:
         logger.warning(f"Device namespace '{device_name}' not found in torch, try to load torch.cuda.")
         return torch.cuda
+
+
+def get_device_id() -> int:
+    """Return current device id based on the device type.
+    Returns:
+        device index
+    """
+    return get_torch_device().current_device()

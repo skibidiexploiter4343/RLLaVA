@@ -17,7 +17,7 @@ from rllava.utils.dist_utils import (
     gather_batch,
 )
 from .utils.core_algos import kl_penalty, get_kl_controller
-from rllava.utils.logging import print_rank0
+from rllava.utils.logger.aggregate_logger import print_rank_0
 from .plugins.rollout import Rollout
 from transformers import AutoConfig
 from rllava.engine import EngineFactory
@@ -41,7 +41,7 @@ class PPO():
             attn_implementation=config.actor.model.attn_implementation,
             **config.actor.model.override_config,
         )
-        print_rank0(f"Model config: {self.model_config}")
+        print_rank_0(f"Model config: {self.model_config}")
 
         if config.algorithm.use_kl_in_reward and config.actor.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
@@ -63,7 +63,7 @@ class PPO():
         
         if config.rollout.n > 1:
             self.config.actor.ppo_mini_batch_size *= config.rollout.n
-            print_rank0(f"Actor will use global batch size {self.config.actor.ppo_mini_batch_size}.")
+            print_rank_0(f"Actor will use global batch size {self.config.actor.ppo_mini_batch_size}.")
         
         if self.use_critic:
             if self.config.data.train_batch_size % self.config.critic.ppo_mini_batch_size != 0:
@@ -79,14 +79,11 @@ class PPO():
         # Injected plugins/components (with sensible fallbacks)
         self.adv_estimator = adv_estimator
 
-        # Initialize Accelerator for unified distributed training management
-        train_engine = EngineFactory()(config.actor)
-
         self.actor = Actor(config.actor, 
                            policy_loss=policy_loss,
                            tokenizer=tokenizer,
-                           accelerator=train_engine)
-        self.critic = Critic(config.critic, accelerator=train_engine) if config.critic is not None else None
+                           processor=processor)
+        self.critic = Critic(config.critic) if config.critic is not None else None
 
         self.reward = reward
         self.rollout = rollout
@@ -147,7 +144,7 @@ class PPO():
     def rollout_batch(self, data_iterator) -> DataProto:
         batch = None
         num_try_make_batch = 0
-        print_rank0("Start generating batch...")
+        print_rank_0("Start generating batch...")
         with self.generate_context():
             while True:
                 num_try_make_batch += 1
@@ -161,14 +158,14 @@ class PPO():
                 current_batch_size = len(batch) // self.rollout.n
                 rollout_batch_size = self.train_batch_size
                 if current_batch_size < rollout_batch_size:
-                    print_rank0(f"{current_batch_size=} < {rollout_batch_size=}")
+                    print_rank_0(f"{current_batch_size=} < {rollout_batch_size=}")
                     max_try_make_batch = self.config.trainer.max_try_make_batch
                     if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
-                        print_rank0(f"{num_try_make_batch=}. Continue generating...")
+                        print_rank_0(f"{num_try_make_batch=}. Continue generating...")
                     else:
                         raise ValueError(f"{num_try_make_batch=} >= {max_try_make_batch=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
                 else:
-                    print_rank0(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
+                    print_rank_0(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                     result = batch[: self.train_batch_size * self.rollout.n]
                     result.meta_info["global_token_num"] = torch.sum(result.batch["attention_mask"], dim=-1).tolist()
                     result = result.chunk(dist.get_world_size())[dist.get_rank()]
@@ -176,17 +173,12 @@ class PPO():
         
     @contextmanager
     def generate_context(self):
-        # If using external service, skip local weight sync. Latest weights will be
-        # pushed to service explicitly in the training loop before rollout/validation.
-        if self.config.rollout.service_mode:
-            yield
-            return
-
-        unwrap_model_for_generation = self.actor.unwrap_model_for_generation()
-        with unwrap_model_for_generation() as unwrapped_model:
+        
+        with self.actor.unwrap_model_for_generation() as unwrapped_model:
             self.rollout.rollout_engine.load(unwrapped_model)
-            yield
-            self.rollout.rollout_engine.offload()
+
+        yield
+        self.rollout.rollout_engine.offload()
 
     def compute_values(self, batch):
         return self.critic.compute_values(batch)

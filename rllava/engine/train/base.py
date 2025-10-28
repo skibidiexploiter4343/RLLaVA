@@ -1,10 +1,6 @@
-import torch
-from typing import Dict, Optional, Union, Any
-from accelerate import Accelerator
-from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin, DeepSpeedPlugin
-from ...data.protocol import DataProto
-from ...utils.logging import print_rank0
-from contextlib import nullcontext
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from contextlib import contextmanager
 
 
 class TrainEngine:
@@ -16,30 +12,36 @@ class TrainEngine:
     
     def __init__(self, config):
         self.config = config
+        self.device_mesh = None
 
     @property
-    def world_size(self):
-        raise NotImplementedError("world_size is not implemented")
-    
+    def world_size(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_world_size()
+        return 1
+
     @property
-    def rank(self):
-        raise NotImplementedError("rank is not implemented")
-    
+    def rank(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return 0
+
     @property
-    def num_processes(self):
-        raise NotImplementedError("num_processes is not implemented")
-    
+    def num_processes(self) -> int:
+        return self.world_size
+
     @property
-    def is_main_process(self):
-        raise NotImplementedError("is_main_process is not implemented")
+    def is_main_process(self) -> bool:
+        return self.rank == 0
     
-    def wait_for_everyone(self):
-        raise NotImplementedError("wait_for_everyone is not implemented")
+    def wait_for_everyone(self) -> None:
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def prepare(self, *args, **kwargs):
         raise NotImplementedError("prepare is not implemented")
 
-    def get_init_weight_context(self, use_meta_tensor=True):
+    def get_init_weight_context(self, use_meta_tensor=True, mesh: DeviceMesh = None):
         raise NotImplementedError("get_init_weight_context is not implemented")
     
     def unwrap_model(self, model):
@@ -48,18 +50,26 @@ class TrainEngine:
     def unwrap_model_for_generation(self, model, is_peft_model):
         raise NotImplementedError("unwrap_model_for_generation is not implemented")
     
-    def load_state(self, checkpoint_path):
+    def load_state(self, model, optimizer, lr_scheduler, checkpoint_path):
         raise NotImplementedError("load_state is not implemented")
     
-    def save_state(self, checkpoint_path):
+    def save_state(self, model, optimizer, lr_scheduler, checkpoint_path):
         raise NotImplementedError("save_state is not implemented")
     
     def backward(self, loss):
         raise NotImplementedError("backward is not implemented")
     
-    def clip_grad_norm_(self, parameters, max_norm):
+    def clip_grad_norm_(self, model, max_norm):
         raise NotImplementedError("clip_grad_norm_ is not implemented")
     
     def get_model_weights(self, model=None):
         raise NotImplementedError("get_model_weights is not implemented")
-    
+
+    @contextmanager
+    def eval(self, model):
+        pass
+
+    @contextmanager
+    def train(self, model, optimizer):
+        pass
+        
