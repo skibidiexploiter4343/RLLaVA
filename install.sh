@@ -277,7 +277,7 @@ install_basic_deps() {
         "pillow==11.1.0"
         "megfile==4.1.6"
         "qwen_vl_utils==0.0.10"
-        "opencv-python==4.11.0.86"
+        "opencv-python-headless>=4.11.0"
         "av==14.2.0"
         "decord==0.6.0"
         "gradio==5.31.0"
@@ -358,6 +358,66 @@ install_optional_packages() {
         print_warning "CUDA environment not properly configured, some packages may fail to install"
     fi
     
+    # Install vllm dependencies first (before vllm itself)
+    print_info "Installing vllm dependencies..."
+    
+    # Fix lark version conflict first (vllm requires lark==1.2.2, but jupyterlab installed 1.3.0)
+    print_info "Fixing lark version conflict (downgrading to 1.2.2 for vllm compatibility)..."
+    install_with_mirror_fallback "lark==1.2.2" || {
+        print_warning "Failed to downgrade lark, continuing..."
+    }
+    
+    vllm_deps=(
+        "blake3"
+        "cachetools"
+        "compressed-tensors==0.9.3"
+        "depyf==0.18.0"
+        "gguf>=0.13.0"
+        "lm-format-enforcer<0.11,>=0.10.11"
+        "mistral_common[opencv]>=1.5.4"
+        "msgspec"
+        "numba==0.61.2"
+        "openai>=1.52.0"
+        "opentelemetry-api<1.27.0,>=1.26.0"
+        "opentelemetry-exporter-otlp<1.27.0,>=1.26.0"
+        "opentelemetry-sdk<1.27.0,>=1.26.0"
+        "opentelemetry-semantic-conventions-ai<0.5.0,>=0.4.1"
+        "outlines==0.1.11"
+        "partial-json-parser"
+        "prometheus-fastapi-instrumentator>=7.0.0"
+        "ray[cgraph]!=2.44.*,>=2.43.0"
+        "tiktoken>=0.6.0"
+        "watchfiles"
+    )
+    
+    # Platform-specific dependencies
+    PLATFORM=$(uname -m)
+    if [ "$PLATFORM" = "x86_64" ] || [ "$PLATFORM" = "arm64" ] || [ "$PLATFORM" = "aarch64" ]; then
+        vllm_deps+=("llguidance<0.8.0,>=0.7.9")
+        if [ "$PLATFORM" = "x86_64" ] || [ "$PLATFORM" = "aarch64" ]; then
+            vllm_deps+=("xgrammar==0.1.18")
+        fi
+    fi
+    
+    for package in "${vllm_deps[@]}"; do
+        local name=$(echo "$package" | cut -d'=' -f1 | cut -d'[' -f1)
+        # Extract version requirement if present
+        local version_req=$(echo "$package" | grep -oE '[>=<]+[0-9.]+' | head -1 || echo "")
+        
+        # Check if package is already installed (skip check for version ranges as they're complex)
+        if [ -z "$version_req" ]; then
+            if pip show "$name" &>/dev/null; then
+                print_info "✓ vllm dependency $name is already installed, skipping..."
+                continue
+            fi
+        fi
+        
+        print_info "Installing vllm dependency: $package..."
+        install_with_mirror_fallback "$package" || {
+            print_warning "Failed to install $package, continuing..."
+        }
+    done
+    
     # Optional packages array
     optional_packages=(
         "xformers==0.0.29.post2"
@@ -376,13 +436,21 @@ install_optional_packages() {
             print_info "✓ $package is already installed"
         else
             print_info "Installing $package..."
-            # Use --no-deps to avoid reinstalling dependencies that may cause conflicts
-            install_with_mirror_fallback "$package" "--no-deps" || {
-                print_warning "$package installation failed with --no-deps, trying with dependencies..."
+            
+            # Special handling for vllm: install without --no-deps since we already installed dependencies
+            if [ "$name" = "vllm" ]; then
                 install_with_mirror_fallback "$package" || {
                     print_warning "$package installation failed, skipping..."
                 }
-            }
+            else
+                # Use --no-deps to avoid reinstalling dependencies that may cause conflicts
+                install_with_mirror_fallback "$package" "--no-deps" || {
+                    print_warning "$package installation failed with --no-deps, trying with dependencies..."
+                    install_with_mirror_fallback "$package" || {
+                        print_warning "$package installation failed, skipping..."
+                    }
+                }
+            fi
         fi
     done
     

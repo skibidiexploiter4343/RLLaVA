@@ -158,23 +158,8 @@ class ActorConfig:
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
     global_batch_size_per_device: int = field(default=-1, init=False)
-    use_kl_loss: bool = True
-    use_kl_in_reward: bool = False
     kl_loss_coef: float = 0.01
     kl_loss_type: str = "low_var_kl"
-
-
-@dataclass
-class RefConfig:
-    strategy: str = "fsdp"
-    fsdp: FSDPConfig = field(default_factory=FSDPConfig)
-    deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-    # below are auto keys
-    log_prob_micro_batch_size_per_gpu: int = field(default=-1, init=False)
-    padding_free: bool = field(default=False, init=False)
-    dynamic_batching: bool = field(default=False, init=False)
-    ulysses_size: int = field(default=1, init=False)
-    use_torch_compile: bool = field(default=True, init=False)
 
 
 @dataclass
@@ -206,6 +191,8 @@ class AlgorithmConfig:
     """advantage estimator: `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`, etc"""
     norm_adv_by_std_in_grpo: bool = True
     """whether to normalize advantage by standard deviation in grpo"""
+    use_kl_loss: bool = True
+    """whether to use kl loss"""
     kl_penalty: str = "kl"
     """kl penalty type, support `kl`, `abs`, `mse`, `low_var_kl`, `full`"""
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
@@ -227,7 +214,6 @@ class PPOConfig(BaseConfig):
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     actor: ActorConfig = field(default_factory=ActorConfig)
     critic: Optional[CriticConfig] = None
-    ref: RefConfig = field(default_factory=RefConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
 
@@ -239,10 +225,4 @@ class PPOConfig(BaseConfig):
         self.rollout.min_pixels = self.data.min_pixels
         self.rollout.max_pixels = self.data.max_pixels
         self.rollout.video_fps = self.data.video_fps
-        self.actor.use_kl_in_reward = self.algorithm.use_kl_in_reward
-        self.ref.log_prob_micro_batch_size_per_gpu = self.actor.log_prob_micro_batch_size_per_gpu
-        self.ref.padding_free = self.actor.padding_free
-        self.ref.ulysses_size = self.actor.ulysses_size
-        self.ref.use_torch_compile = self.actor.use_torch_compile
-        self.model_path = self.actor.model.model_path
 

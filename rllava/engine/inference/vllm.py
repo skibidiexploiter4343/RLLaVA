@@ -97,6 +97,9 @@ class VLLMEngine(InferenceEngine):
             setattr(self.sampling_params, key, value)
 
     def generate(self, prompts: DataProto) -> DataProto:
+        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            self.inference_engine.wake_up(tags=["kv_cache"]) # +10.5G
+
         # left-padded attention_mask
         input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)
         attention_mask: torch.Tensor = prompts.batch["attention_mask"]
@@ -158,7 +161,7 @@ class VLLMEngine(InferenceEngine):
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.view(1, -1).expand(batch_size, -1)
         if position_ids.dim() == 3:  # qwen2vl mrope
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
 
         # prompt: left pad + response: right pad
         # attention_mask: [0,0,0,0,1,1,1,1 | 1,1,1,0,0,0,0,0]
@@ -220,14 +223,11 @@ class VLLMEngine(InferenceEngine):
         
         print_gpu_memory_usage("Before vllm wake up in vllm engine")
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["weights"])
+            self.inference_engine.wake_up(tags=["weights"]) # +4.5G
         else:
             self.inference_engine.wake_up()
         
-        self.update_weights(model)
-        
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["kv_cache"])
+        self.update_weights(model) # +4.9G
 
         print_gpu_memory_usage("After vllm wake up in vllm engine")
 

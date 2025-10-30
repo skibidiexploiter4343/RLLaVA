@@ -147,37 +147,37 @@ class RLHFDataset(Dataset):
         else:
             return [{"role": "user", "content": prompt_str}]
 
-    # def _filter_overlong_prompts(self, example: Dict[str, Any]) -> bool:
-    #     messages = self._build_messages(example)
-    #     if self.image_key in example:
-    #         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    #         images = example[self.image_key]
-    #         if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
-    #             images = [os.path.join(self.image_dir, image) for image in images]
+    def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
+        messages = self._build_messages(example) # [{'role': 'user', 'content': [{...}, {...}]}]
+        if self.image_key in example:
+            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            images = example[self.image_key]
+            if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
+                images = [os.path.join(self.image_dir, image) for image in images]
 
-    #         processed_images = [] if len(images) != 0 else None  # text-only data
-    #         for image in images:
-    #             processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
+            processed_images = [] if len(images) != 0 else None  # text-only data
+            for image in images:
+                processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
 
-    #         model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
-    #         return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
-    #     elif self.video_key in example:
-    #         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    #         videos = example[self.video_key]
-    #         if self.image_dir is not None and len(videos) != 0 and isinstance(videos[0], str):  # video paths
-    #             videos = [os.path.join(self.image_dir, video) for video in videos]
+            model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
+            return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+        elif self.video_key in example:
+            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            videos = example[self.video_key]
+            if self.image_dir is not None and len(videos) != 0 and isinstance(videos[0], str):  # video paths
+                videos = [os.path.join(self.image_dir, video) for video in videos]
 
-    #         processed_videos = [] if len(videos) != 0 else None  # text-only data
-    #         for video in videos:
-    #             processed_videos.append(process_video(video, self.min_pixels, self.max_pixels, self.video_fps))
+            processed_videos = [] if len(videos) != 0 else None  # text-only data
+            for video in videos:
+                processed_videos.append(process_video(video, self.min_pixels, self.max_pixels, self.video_fps))
 
-    #         model_inputs = self.processor(
-    #             videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt"
-    #         )
-    #         return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
-    #     else:
-    #         input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-    #         return len(input_ids) <= self.max_prompt_length
+            model_inputs = self.processor(
+                videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt"
+            )
+            return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+        else:
+            input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+            return len(input_ids) <= self.max_prompt_length
 
     def __len__(self):
         return len(self.dataset)
@@ -203,11 +203,11 @@ class RLHFDataset(Dataset):
             model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
-            image_grid_thw = model_inputs.pop("image_grid_thw")[0]
-            pixel_values = model_inputs.pop("pixel_values")
+            # image_grid_thw = model_inputs.pop("image_grid_thw")[0]
+            # pixel_values = model_inputs.pop("pixel_values")
             example["multi_modal_data"] = {"images": images}
-            example['pixel_values'] = pixel_values
-            example['image_grid_thw'] = image_grid_thw
+            # example['pixel_values'] = pixel_values
+            # example['image_grid_thw'] = image_grid_thw
         elif self.video_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             videos = example.pop(self.video_key)
@@ -239,8 +239,13 @@ class RLHFDataset(Dataset):
             attention_mask = model_inputs.pop("attention_mask")[0]
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            # qwen2vl mrope
-            position_ids = get_rope_index(
+            # qwen-vl mrope
+            if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                from rllava.model.patch.qwen3_vl import get_rope_index
+            else:
+                from rllava.model.patch.qwen2_vl import get_rope_index
+
+            vision_position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids,
                 image_grid_thw=model_inputs.get("image_grid_thw", None),
@@ -248,6 +253,9 @@ class RLHFDataset(Dataset):
                 second_per_grid_ts=model_inputs.get("second_per_grid_ts", None),
                 attention_mask=attention_mask,
             )  # (3, seq_length)
+            text_position_ids = torch.arange(len(input_ids)).unsqueeze(0)  # (1, seq_length)
+            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)  # (4, seq_length)
+            # position_ids = vision_position_ids
         else:
             position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)  # (seq_length,)
 

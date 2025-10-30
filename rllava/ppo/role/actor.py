@@ -8,7 +8,6 @@ from typing import Dict
 import torch.nn.functional as F
 from trl import get_peft_config
 from peft import get_peft_model
-from deprecated import deprecated
 from ..config import ActorConfig
 from rllava.data.protocol import DataProto
 from rllava.utils.device import get_torch_device
@@ -18,6 +17,7 @@ from tqdm import tqdm
 from collections import defaultdict
 from transformers import AutoModelForVision2Seq, AutoModelForCausalLM, AutoConfig
 from einops import rearrange
+from rllava.model.patch.monkey_patch import apply_monkey_patch
 from rllava.utils import torch_functional as VF
 from rllava.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from rllava.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
@@ -75,16 +75,26 @@ class Actor():
         
         print_rank_0(f"Actor will use global batch size per device {self.config.global_batch_size_per_device}.")
 
-    def initialize(self, model_config: AutoConfig):
-        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+    def initialize(self):
+        self.model_config = AutoConfig.from_pretrained(
+            self.config.model.model_path,
+            trust_remote_code=self.config.model.trust_remote_code,
+            bos_token_id=self.tokenizer.bos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            attn_implementation=self.config.model.attn_implementation,
+            **self.config.model.override_config,
+        )
+        print_rank_0(f"Model config: {self.model_config}")
+
+        if type(self.model_config) in AutoModelForVision2Seq._model_mapping.keys():
             model_class = AutoModelForVision2Seq
         else:
             model_class = AutoModelForCausalLM
         
-        # Initialize model directly in Actor class
-        self.init_model(model_class, model_config)
+        self.init_model(model_class, self.model_config)
         self.init_optimizer()
-        self.flops_counter = FlopsCounter(model_config)
+        self.flops_counter = FlopsCounter(self.model_config)
 
     def unwrap_model(self):
         return self.accelerator.unwrap_model(self.model)
@@ -126,6 +136,13 @@ class Actor():
                 attn_implementation=self.config.model.attn_implementation,
                 trust_remote_code=self.config.model.trust_remote_code,
             )
+
+            apply_monkey_patch(
+                model=self.model,
+                use_remove_padding=self.config.padding_free,
+                ulysses_sp_size=self.config.ulysses_size
+            )
+
             self.model.to(torch_dtype)
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -145,30 +162,6 @@ class Actor():
         log_gpu_memory_usage(f"After init Actor from HF AutoModel", logger=logger)
         self.model = self.accelerator.prepare(self.model)
         log_gpu_memory_usage(f"After Actor Accelerator prepare", logger=logger)
-
-
-        # Handle reference model if needed
-        if self.config.use_kl_loss or self.config.use_kl_in_reward:
-            if peft_config is not None:
-                # If PEFT is used, disable adapters for reference
-                ref_model = self.model.disable_adapter()
-                self.ref_model = ref_model
-            else:
-                # Load separate reference model
-                with init_weight():
-                    self.ref_model = model_class.from_pretrained(
-                        self.config.model.model_path,
-                        config=self.config.model,
-                        torch_dtype=torch.bfloat16,
-                        attn_implementation=self.config.model.attn_implementation,
-                        trust_remote_code=self.config.model.trust_remote_code,
-                    )
-                for param in self.ref_model.parameters():
-                    param.requires_grad = False
-
-            log_gpu_memory_usage(f"After init Ref from HF AutoModel", logger=logger)
-            self.ref_model = self.accelerator.prepare(self.ref_model, forward_only=True)
-            log_gpu_memory_usage(f"After Ref Accelerator prepare", logger=logger)
                
     def init_optimizer(self):
         # Create optimizer
@@ -213,100 +206,6 @@ class Actor():
         self.optimizer, self.lr_scheduler = self.accelerator.prepare(self.optimizer, self.lr_scheduler)
         log_gpu_memory_usage(f"After Optimizer and LR Scheduler Accelerator prepare", logger=logger)
 
-    @deprecated("Use init_model and init_optimizer instead")
-    def _init_model_and_optimizer(self, model_class, model_config):
-        """Initialize model and optimizer directly in Actor class."""
-        print_rank_0("Initializing model and optimizer in Actor class...")
-        
-        # Load model
-        torch_dtype = self.config.model.torch_dtype
-        if torch_dtype is None:
-            torch_dtype = torch.float32
-        else:
-            torch_dtype = PrecisionType.to_dtype(torch_dtype)
-        
-        init_weight = self.accelerator.get_init_weight_context(use_meta_tensor=not model_config.tie_word_embeddings)
-        with init_weight():
-            self.model = model_class.from_pretrained(
-                self.config.model.model_path,
-                config=model_config,
-                torch_dtype=torch_dtype,
-                attn_implementation=self.config.model.attn_implementation,
-                trust_remote_code=self.config.model.trust_remote_code,
-            )
-        if self.config.model.enable_gradient_checkpointing:
-            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        self.config.model.lora_target_modules = find_all_linear_names(self.model, ['visual','connector', 'vision_tower'] )
-        peft_config = get_peft_config(self.config.model)
-        
-        if peft_config is not None:
-            self.is_peft_model = True
-            self.model.enable_input_require_grads()
-            # If PEFT is used, wrap the model with PEFT
-            peft_model = get_peft_model(self.model, peft_config)
-            self.model = peft_model
-
-        if is_rank0() == 0: 
-            print_model_size(self.model)
-        log_gpu_memory_usage(f"After init Actor from HF AutoModel", logger=logger)
-        self.model = self.accelerator.prepare(self.model)
-        log_gpu_memory_usage(f"After Actor Accelerator prepare", logger=logger)
-
-        # Handle reference model if needed
-        if self.config.use_kl_loss or self.config.use_kl_in_reward:
-            if peft_config is not None:
-                # If PEFT is used, disable adapters for reference
-                ref_model = self.model.disable_adapter()
-                self.ref_model = ref_model
-            else:
-                # Load separate reference model
-                with init_weight():
-                    self.ref_model = model_class.from_pretrained(
-                        self.config.model.model_path,
-                        config=self.config.model,
-                        torch_dtype=torch.bfloat16,
-                        attn_implementation=self.config.model.attn_implementation,
-                        trust_remote_code=self.config.model.trust_remote_code,
-                    )
-                for param in self.ref_model.parameters():
-                    param.requires_grad = False
-
-            log_gpu_memory_usage(f"After init Ref from HF AutoModel", logger=logger)
-            self.ref_model = self.accelerator.prepare(self.ref_model)
-            log_gpu_memory_usage(f"After Ref Accelerator prepare", logger=logger)
-               
-        # Create optimizer
-        if self.config.optim.strategy == "adamw":
-            self.optimizer = torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.config.optim.lr,
-                betas=self.config.optim.betas,
-                weight_decay=self.config.optim.weight_decay,
-                fused=True,
-            )
-        elif self.config.optim.strategy == "adamw_bf16":
-            from utils.torch_functional import AnyPrecisionAdamW
-            self.optimizer = AnyPrecisionAdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=self.config.optim.lr,
-                betas=self.config.optim.betas,
-                weight_decay=self.config.optim.weight_decay,
-            )
-        else:
-            raise NotImplementedError(f"Optimizer {self.config.optim.strategy} not supported.")
-        
-        # Create learning rate scheduler   
-        if self.config.optim.lr_warmup_steps is not None:
-            num_warmup_steps = self.config.optim.lr_warmup_steps
-        else:
-            num_warmup_steps = int(self.config.optim.lr_warmup_ratio * self.config.optim.training_steps)
-        
-        self.lr_scheduler = get_constant_schedule_with_warmup(
-            optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
-        )
-        self.optimizer, self.lr_scheduler = self.accelerator.prepare(self.optimizer, self.lr_scheduler)
-        log_gpu_memory_usage(f"After Optimizer and LR Scheduler Accelerator prepare", logger=logger)
-
     def _forward_micro_batch(self, model, micro_batch: Dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False, return_logits: bool = False):
         """
         Returns:
@@ -319,7 +218,7 @@ class Actor():
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
         if position_ids.dim() == 3:  # qwen2vl mrope
-            position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+            position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
         multi_modal_inputs = defaultdict(list)
         if "multi_modal_inputs" in micro_batch:
@@ -345,7 +244,7 @@ class Actor():
                     index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
                     .transpose(0, 1)
                     .unsqueeze(1)
-                )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
+                )  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
             else:
                 position_ids_rmpad = index_first_axis(
                     rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
@@ -420,7 +319,7 @@ class Actor():
         return entropy, log_probs, logits_slice
 
     @torch.no_grad()
-    def compute_log_probs(self, data: DataProto, temperature: float = None, is_ref: bool = False) -> DataProto:
+    def compute_log_probs(self, data: DataProto, temperature: float = None) -> DataProto:
         """Compute log probabilities for the given batch.
         
         Args:
@@ -447,14 +346,11 @@ class Actor():
         if self.accelerator.is_main_process:
             micro_batches = tqdm(micro_batches, desc="Compute log probs", position=1)
 
-        if is_ref:
-            if self.is_peft_model == True:
-                model = self.model
-            else:
-                model = self.ref_model
+        if self.is_peft_model:
+            ctx = self.model.disable_adapter()
         else:
-            model = self.model
-        ctx = model.disable_adapter() if self.is_peft_model == True and is_ref else nullcontext()
+            ctx = nullcontext()
+        model = self.model
         with ctx, self.accelerator.eval(model):
             for micro_batch in micro_batches:
                 model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -500,6 +396,8 @@ class Actor():
         """Update policy using Accelerator for unified training management."""
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        use_kl_loss = data.meta_info["use_kl_loss"]
+
         select_keys = [
             "responses",
             "response_mask",
@@ -508,8 +406,10 @@ class Actor():
             "position_ids",
             "advantages",
         ]
-        if self.config.use_kl_loss:
+        
+        if use_kl_loss:
             select_keys.append("ref_log_probs")
+
         if self.config.tis_imp_ratio_cap > 0:
             assert "rollout_log_probs" in data.batch.keys(), (
                 "Truncated Importance Sampling (TIS) requires to configure "
@@ -611,7 +511,7 @@ class Actor():
                             policy_loss = policy_loss + self.config.sft_loss_coef * sft_loss
                             micro_batch_metrics["actor/sft_loss"] = sft_loss.detach().item() * loss_scale_factor
                     
-                    if self.config.use_kl_loss:
+                    if use_kl_loss:
                         ref_log_probs = model_inputs["ref_log_probs"]
                         # compute kl loss
                         kld = kl_penalty(

@@ -4,12 +4,13 @@ import numpy as np
 import torch.distributed as dist
 from contextlib import contextmanager
 from collections import defaultdict
-from copy import deepcopy
 from .config import PPOConfig
 from .role.actor import Actor
 from .role.critic import Critic
 from .role.reward import Reward
+from .role.ref import Ref
 from rllava.data.protocol import DataProto
+from rllava.data.data_utils import process_image, process_video
 from rllava.utils import torch_functional as VF
 from rllava.utils.dist_utils import (
     dist_gather_then_scatter,
@@ -31,19 +32,9 @@ class PPO():
         self.train_batch_size = config.data.train_batch_size
         self.tokenizer = tokenizer
         self.processor = processor
+        self._cache = {}
 
-        self.model_config = AutoConfig.from_pretrained(
-            config.model_path,
-            trust_remote_code=config.actor.model.trust_remote_code,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            attn_implementation=config.actor.model.attn_implementation,
-            **config.actor.model.override_config,
-        )
-        print_rank_0(f"Model config: {self.model_config}")
-
-        if config.algorithm.use_kl_in_reward and config.actor.use_kl_loss:
+        if config.algorithm.use_kl_in_reward and config.algorithm.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
         if self.config.algorithm.use_kl_in_reward:
@@ -85,6 +76,12 @@ class PPO():
                            processor=processor)
         self.critic = Critic(config.critic) if config.critic is not None else None
 
+        if config.algorithm.use_kl_loss or config.algorithm.use_kl_in_reward:
+            if self.actor.is_peft_model:
+                self.ref = None
+            else:
+                self.ref = Ref(config.actor, tokenizer=tokenizer, processor=processor)
+
         self.reward = reward
         self.rollout = rollout
 
@@ -110,16 +107,21 @@ class PPO():
         self.filter = online_sampling
 
     def initialize(self, train_dataloader):
-        self.actor.initialize(self.model_config)
+        self.training_steps = self.get_training_steps(train_dataloader)
+
+        self.config.actor.optim.training_steps = self.training_steps
+        self.actor.initialize()
+
+        if self.critic is not None:
+            self.config.critic.optim.training_steps = self.training_steps
+            self.critic.initialize()
+
+        if self.ref is not None:
+            self.ref.initialize(self.actor)
+        
         self.reward.initialize()
 
         self.rollout.initialize(self.config.actor.model.model_path)
-        
-        self.training_steps = self.get_training_steps(train_dataloader)
-        self.config.actor.optim.training_steps = self.training_steps
-        if self.use_critic:
-            self.config.critic.optim.training_steps = self.training_steps
-            self.critic.initialize()
 
     def get_training_steps(self, train_dataloader):  
         if self.config.trainer.max_steps is not None:
@@ -191,28 +193,18 @@ class PPO():
         num_mini_batches = (batch_size + self.config.actor.global_batch_size_per_device - 1) // self.config.actor.global_batch_size_per_device
         on_policy = num_mini_batches == 1 and self.config.actor.ppo_epochs == 1
 
+        self._process_multi_modal_inputs(data)
+
         if not on_policy:
-            old_log_probs = self.compute_old_log_probs(data)
-            data = data.union(old_log_probs)
+            output = self.actor.compute_log_probs(data, temperature=self.config.rollout.temperature)
+            data = data.union(DataProto.from_dict(tensors={"old_log_probs": output}))
 
         # compute ref_log_probs if needed
-        if self.config.actor.use_kl_loss or self.config.algorithm.use_kl_in_reward:
-            ref_log_probs = self.compute_ref_log_probs(data)
-            data = data.union(ref_log_probs)
+        if self.ref is not None:
+            output = self.ref.compute_log_probs(data, temperature=self.config.rollout.temperature)
+            data = data.union(DataProto.from_dict(tensors={"ref_log_probs": output}))
         return data
 
-    def compute_old_log_probs(self, data: DataProto):
-        output = self.actor.compute_log_probs(data, temperature=self.config.rollout.temperature)
-        return DataProto.from_dict(
-                tensors={"old_log_probs": output}, 
-                meta_info={"temperature": self.config.rollout.temperature}
-            )
-
-    def compute_ref_log_probs(self, data: DataProto):
-        output = self.actor.compute_log_probs(data, temperature=self.config.rollout.temperature, is_ref=True)
-        # Wrap result in DataProto with appropriate tensor key
-        return DataProto.from_dict(tensors={"ref_log_probs": output})
-            
     def apply_kl_penalty(self, data: DataProto, kl_ctrl, kl_p="kl"):
         """Apply KL penalty to the token-level rewards.
 
@@ -266,25 +258,70 @@ class PPO():
         return data, adv_metrics
     
     def update_model(self, data: DataProto, global_steps) -> DataProto:
+        self._process_multi_modal_inputs(data)
+
+        data.meta_info["use_kl_loss"] = self.config.algorithm.use_kl_loss
         outputs = []
+
         if self.use_critic:
-            critic_output = self.update_critic(data)
+            critic_output = self.critic.update(data)
             outputs.append(critic_output)
 
         if self.config.trainer.critic_warmup <= global_steps:
-            actor_output = self.update_actor(data)
+            actor_output = self.actor.update(data)
             outputs.append(actor_output)
 
         if len(outputs) == 0:
             return DataProto()
+            
         merged = outputs[0]
         for out in outputs[1:]:
             merged = merged.union(out)
         return merged
     
-    def update_critic(self, data: DataProto):
-        return self.critic.update(data)
-    
-    def update_actor(self, data: DataProto):
-        output = self.actor.update(data)
-        return output
+    def _process_multi_modal_inputs(self, data: DataProto):
+        if "multi_modal_data" not in data.non_tensor_batch:
+            return
+
+        if "uid" in self._cache and not np.all(data.non_tensor_batch["uid"] == self._cache["uid"]):
+            self._cache.clear()
+
+        if "multi_modal_inputs" not in self._cache:
+            min_pixels = data.meta_info["min_pixels"]
+            max_pixels = data.meta_info["max_pixels"]
+            video_fps = data.meta_info["video_fps"]
+            batch_multi_modal_inputs = []
+            multi_modal_inputs_cache = {}  # avoid repeated processing for n > 1 samples
+            for index, multi_modal_data in zip(
+                data.non_tensor_batch["uid"], data.non_tensor_batch["multi_modal_data"]
+            ):  # process multi modal data per sample
+                if index not in multi_modal_inputs_cache:
+                    images, videos = [], []
+                    if "images" in multi_modal_data:
+                        for image in multi_modal_data["images"]:
+                            images.append(process_image(image, min_pixels, max_pixels))
+
+                    if "videos" in multi_modal_data:
+                        for video in multi_modal_data["videos"]:
+                            videos.append(process_video(video, min_pixels, max_pixels, video_fps))
+
+                    if len(images) != 0:
+                        # it's necessary to add `dict` to properly convert batch features to dict
+                        # otherwise the batch features will be converted to dict keys
+                        # see https://github.com/hiyouga/EasyR1/pull/339
+                        multi_modal_inputs = dict(self.processor.image_processor(images=images, return_tensors="pt"))
+                    elif len(videos) != 0:
+                        multi_modal_inputs = dict(
+                            self.processor.image_processor(images=None, videos=videos, return_tensors="pt")
+                        )
+                    else:
+                        multi_modal_inputs = {}
+
+                    multi_modal_inputs_cache[index] = multi_modal_inputs
+
+                batch_multi_modal_inputs.append(multi_modal_inputs_cache[index])
+
+            self._cache["uid"] = data.non_tensor_batch["uid"]
+            self._cache["multi_modal_inputs"] = np.array(batch_multi_modal_inputs, dtype=object)
+
+        data.non_tensor_batch["multi_modal_inputs"] = self._cache["multi_modal_inputs"]

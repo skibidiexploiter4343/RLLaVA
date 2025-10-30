@@ -21,7 +21,20 @@ from rllava.data.protocol import DataProto
 
 
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
-    return {key: np.mean(value) for key, value in metrics.items()}
+    for key, val in metrics.items():
+        if "max" in key:
+            _val = np.max(val)
+        elif "min" in key:
+            _val = np.min(val)
+        else:
+            _val = np.mean(val)
+
+        if isinstance(_val, np.generic):
+            _val = _val.item()
+        elif isinstance(_val, np.ndarray):
+            _val = _val.tolist()
+        metrics[key] = _val
+    return metrics
 
 def compute_length_metrics(batch: DataProto) -> dict[str, Any]:
     max_response_length = batch.batch["responses"].size(-1)
