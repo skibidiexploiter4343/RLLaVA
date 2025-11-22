@@ -1,6 +1,6 @@
 from .ppo import PPO
 from .config import PPOConfig, RolloutConfig
-from .plugins.rollout import Rollout
+from .role.rollout import Rollout
 from .role.reward import Reward
 from rllava.ppo.plugins import get_adv_estimator, get_policy_loss
 

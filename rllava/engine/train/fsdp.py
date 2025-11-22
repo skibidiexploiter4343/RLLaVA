@@ -16,19 +16,19 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterable, Optional
+from contextlib import contextmanager
+from typing import Any, Optional
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from transformers.trainer_pt_utils import get_module_class_from_name
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from rllava.engine.train.base import TrainEngine
 from rllava.utils.performance import log_gpu_memory_usage
-from rllava.utils.dist_utils import is_rank0
 from rllava.utils.logger.aggregate_logger import log_with_rank
-from rllava.utils.config import FSDPConfig, CheckpointConfig
+from rllava.utils.config import FSDPConfig
+from rllava.model.config import CheckpointConfig
 from rllava.utils.device import get_device_id, get_torch_device, get_device_name, is_cuda_available
 from rllava.utils.memory_utils import aggressive_empty_cache
 from rllava.utils.fs import local_mkdir_safe, copy_to_local
@@ -73,19 +73,6 @@ class FSDPAccelerator(TrainEngine):
         self.wrapped_models: list[FSDP] = []
         self.optimizers: list[Optimizer] = []
         self.lr_schedulers: list[LRScheduler] = []
-
-    def get_init_weight_context(self, use_meta_tensor: bool = True, mesh: DeviceMesh = None):
-        from accelerate import init_empty_weights
-        
-        cpu_init_weights = lambda: torch.device("cpu")
-        if use_meta_tensor:
-            if mesh is None:
-                init_context = init_empty_weights if not is_rank0() else cpu_init_weights
-            else:
-                init_context = init_empty_weights if mesh.get_coordinate()[-1] != 0 else cpu_init_weights
-        else:
-            init_context = cpu_init_weights
-        return init_context
 
     def prepare(self, *args: Any, **kwargs: Any):
         """Wrap supported training artefacts with FSDP.

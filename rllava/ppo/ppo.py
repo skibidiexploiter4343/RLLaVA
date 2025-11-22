@@ -5,10 +5,12 @@ import torch.distributed as dist
 from contextlib import contextmanager
 from collections import defaultdict
 from .config import PPOConfig
+from .role.rollout import Rollout
 from .role.actor import Actor
 from .role.critic import Critic
 from .role.reward import Reward
 from .role.ref import Ref
+from .utils.core_algos import kl_penalty, get_kl_controller
 from rllava.data.protocol import DataProto
 from rllava.data.data_utils import process_image, process_video
 from rllava.utils import torch_functional as VF
@@ -17,11 +19,7 @@ from rllava.utils.dist_utils import (
     dist_batch,
     gather_batch,
 )
-from .utils.core_algos import kl_penalty, get_kl_controller
 from rllava.utils.logger.aggregate_logger import print_rank_0
-from .plugins.rollout import Rollout
-from transformers import AutoConfig
-from rllava.engine import EngineFactory
 
 
 
@@ -70,14 +68,16 @@ class PPO():
         self.adv_estimator = adv_estimator
 
         self.actor = Actor(config.actor, 
-                           policy_loss=policy_loss,
                            tokenizer=tokenizer,
-                           processor=processor)
-        self.critic = Critic(config.critic) if config.critic is not None else None
+                           processor=processor,
+                           policy_loss=policy_loss)
+        self.critic = Critic(config.critic, 
+                             tokenizer=tokenizer, 
+                             processor=processor) if config.critic is not None else None
 
         self.ref = None
         if config.algorithm.use_kl_loss or config.algorithm.use_kl_in_reward:
-            if not self.actor.is_peft_model:
+            if not self.actor.config.model.use_peft:
                 self.ref = Ref(config.actor, tokenizer=tokenizer, processor=processor)
 
         self.reward = reward

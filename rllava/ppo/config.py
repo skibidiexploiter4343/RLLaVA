@@ -1,7 +1,8 @@
 import os
 from typing import Any, Dict, Optional
 from dataclasses import asdict, dataclass, field
-from rllava.utils.config import BaseConfig, ModelConfig, OptimConfig, FSDPConfig, DeepSpeedConfig, CheckpointConfig
+from rllava.utils.config import BaseConfig, FSDPConfig, DeepSpeedConfig
+from rllava.model.config import ModelConfig, OptimConfig, CheckpointConfig
 from rllava.engine import VLLMConfig, SGLangConfig
     
 
@@ -81,12 +82,6 @@ class CriticConfig:
     """loss average mode: `token`, `seq`"""
     ppo_epochs: int = 1
     """number of ppo epochs for each rollout batch"""
-    padding_free: bool = False
-    """use padding-free training"""
-    dynamic_batching: bool = True
-    """enable dynamic batching"""
-    ulysses_size: int = 1
-    """ulysses sequence parallel size"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
@@ -140,12 +135,6 @@ class ActorConfig:
     tis_imp_ratio_cap: float = -1
     ppo_epochs: int = 1
     """number of ppo epochs for each rollout batch"""
-    padding_free: bool = True
-    """use padding-free training"""
-    dynamic_batching: bool = True
-    """enable dynamic batching"""
-    ulysses_size: int = 1
-    """ulysses sequence parallel size"""
     use_torch_compile: bool = True
     # UFT-style joint SFT loss (cross-entropy over ground_truth)
     sft_loss_coef: float = 0.0

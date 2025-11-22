@@ -30,9 +30,6 @@ actor:
   ppo_micro_batch_size: 1  
   log_prob_micro_batch_size: 2 
   max_grad_norm: 1.0
-  padding_free: true
-  dynamic_batching: true
-  ulysses_size: 1
   model:
     model_path: Qwen/Qwen2.5-7B-Instruct
     enable_gradient_checkpointing: true

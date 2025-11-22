@@ -1,5 +1,4 @@
 import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh
 from contextlib import contextmanager
 
 
@@ -40,9 +39,6 @@ class TrainEngine:
 
     def prepare(self, *args, **kwargs):
         raise NotImplementedError("prepare is not implemented")
-
-    def get_init_weight_context(self, use_meta_tensor=True, mesh: DeviceMesh = None):
-        raise NotImplementedError("get_init_weight_context is not implemented")
     
     def unwrap_model(self, model):
         raise NotImplementedError("unwrap_model is not implemented")

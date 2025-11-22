@@ -7,10 +7,10 @@ import os
 import transformers
 import torch
 import megfile
-import PIL
 import os
 import random
 import megfile
+import traceback
 import rllava.utils.torch_functional as VF
 from typing import Optional, List, Any
 from qwen_vl_utils import smart_resize
@@ -21,12 +21,11 @@ from PIL import Image, ImageFile
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-from rllava.data.data_utils import process_image, process_video
-from rllava.model.patch.qwen2_vl import get_rope_index
 from .template import TemplateFactory
 from .text_preprocess import TextPreprocess
 from .image_preprocess import ImagePreprocess
 from rllava.utils.arguments import DataArguments
+from rllava.data.data_utils import process_image, process_video
 from rllava.utils.constants import *
 
 
@@ -104,10 +103,11 @@ class RLHFDataset(Dataset):
                 self.format_prompt = f.read()
 
         if filter_overlong_prompts:
+            doc2len = self.build_filter()
             self.dataset = self.dataset.filter(
-                self._filter_overlong_prompts,
-                desc="Filtering overlong prompts",
+                lambda doc: doc2len(doc) <= self.max_prompt_length,
                 num_proc=filter_overlong_prompts_workers,
+                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens"
             )
             # self.dataset = self.dataset.filter(
             #     lambda doc: len(tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
@@ -146,6 +146,60 @@ class RLHFDataset(Dataset):
             return [{"role": "user", "content": content_list}]
         else:
             return [{"role": "user", "content": prompt_str}]
+
+    def build_filter(self):
+        if self.processor is not None:
+            def doc2len(doc) -> int:
+                try:
+                    messages = self._build_messages(doc)
+                    # pass tool schemas if available so the processor can format prompts
+                    raw_prompt = self.processor.apply_chat_template(
+                        messages, add_generation_prompt=True, tokenize=False
+                    )
+                    if self.image_key in doc and doc[self.image_key]:
+                        images = [
+                            process_image(image, self.min_pixels, self.max_pixels) for image in doc[self.image_key]
+                        ]
+                    else:
+                        images = None
+
+                    if self.video_key in doc and doc[self.video_key]:
+                        videos, video_metadata = zip(
+                            *[
+                                process_video(
+                                    video, self.min_pixels, self.max_pixels, self.video_fps
+                                )
+                                for video in doc[self.video_key]
+                            ],
+                            strict=True,
+                        )
+                        videos = list(videos)
+                        video_metadata = list(video_metadata)
+                        videos_kwargs = {"video_metadata": video_metadata, "do_sample_frames": False}
+                    else:
+                        videos = None
+                        videos_kwargs = {}
+
+                    return len(
+                        self.processor(text=[raw_prompt], images=images, videos=videos, videos_kwargs=videos_kwargs)[
+                            "input_ids"
+                        ][0]
+                    )
+                except Exception:
+                    print("Error processing one of the samples, skipping...")
+                    traceback.print_exc()
+                    return self.max_prompt_length + 1
+        else:
+            def doc2len(doc) -> int:
+                try:
+                    return len(
+                        self.tokenizer.apply_chat_template(doc[self.prompt_key], add_generation_prompt=True)
+                    )
+                except Exception:
+                    print("Error processing one of the samples, skipping...")
+                    traceback.print_exc()
+                    return self.max_prompt_length + 1
+        return doc2len
 
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
         messages = self._build_messages(example) # [{'role': 'user', 'content': [{...}, {...}]}]
