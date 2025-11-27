@@ -72,6 +72,8 @@ torchrun -m rllava.train.pipeline.rlvr \
   algorithm.adv_estimator=grpo  # Switch algorithms here (rloo, remax, ppo, etc.)
 ```
 
+For detailed usage instructions, please refer to `examples/README.md`
+
 ## 📦 Supported Scope
 
 ### Algorithms
