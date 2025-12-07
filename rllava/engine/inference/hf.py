@@ -1,21 +1,20 @@
 import os
 import torch
 import logging
-import contextlib
 import numpy as np
 from tqdm import tqdm
 from typing import Optional, Dict, TYPE_CHECKING
 from collections import defaultdict
 from transformers import PreTrainedTokenizer, ProcessorMixin, AutoModelForVision2Seq, AutoModelForCausalLM, AutoConfig, GenerationConfig
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from .base import InferenceEngine
 from .. import register_engine
 from rllava.utils import torch_functional as VF
+from torch.distributed.tensor import DTensor
 from tensordict import TensorDict
 from rllava.data.protocol import DataProto
 from rllava.data.data_utils import process_image, process_video
-from rllava.utils.performance import log_gpu_memory_usage
 from rllava.utils.logger.aggregate_logger import print_rank_0
+from rllava.utils.device import get_device_id
 
 
 
@@ -88,7 +87,7 @@ class HFEngine(InferenceEngine):
                 images, videos = [], []
                 if "images" in multi_modal_data:
                     for image in multi_modal_data["images"]:
-                        images.append(process_image(image, min_pixels, max_pixels))
+                        images.append(process_image(image, min_pixels, max_pixels, self.processor))
                 
                 if "videos" in multi_modal_data:
                     for video in multi_modal_data["videos"]:
@@ -280,10 +279,11 @@ class HFEngine(InferenceEngine):
         Returns:
             Iterator over (name, tensor) pairs
         """
+        device = get_device_id() 
         for name in sorted(weights.keys()):
             tensor = weights[name]
             # Handle DTensor for distributed training
             if hasattr(tensor, 'full_tensor'):
-                yield name, tensor.full_tensor() if self.world_size != 1 else tensor
+                yield name, tensor.to(device, non_blocking=True).full_tensor() if (self.world_size != 1 or isinstance(tensor, DTensor)) else tensor
             else:
                 yield name, tensor 

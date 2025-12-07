@@ -27,7 +27,7 @@ RLLaVA is a user-friendly framework for multi-modal RL. It features an **RL-cent
 ```bash
 git clone https://github.com/TinyLoopX/RLLaVA && cd RLLaVA
 
-conda create -n rllava python==3.11 && conda activate rllava
+conda create -n rllava python==3.12 && conda activate rllava
 
 bash ./install.sh
 ```

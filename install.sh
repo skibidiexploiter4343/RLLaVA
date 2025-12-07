@@ -124,12 +124,12 @@ get_exact_version() {
 check_python_version() {
     print_info "Checking Python version..."
     python_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    required_version="3.11"
+    required_version="3.12"
     
-    if python3 -c "import sys; exit(0 if sys.version_info >= (3, 11) else 1)"; then
+    if python3 -c "import sys; exit(0 if sys.version_info >= (3, 12) else 1)"; then
         print_success "Python version check passed: $python_version"
     else
-        print_error "Python version does not meet requirements. Need >= 3.11, current version: $python_version"
+        print_error "Python version does not meet requirements. Need >= 3.12, current version: $python_version"
         exit 1
     fi
 }
@@ -233,6 +233,7 @@ except:
 check_package_installed() {
     local package_name=$1
     local required_version=$2
+    local exact_match_only=${3:-false}  # Third parameter: if true, only check exact match
     
     if [ -z "$package_name" ] || [ -z "$required_version" ]; then
         return 1
@@ -248,6 +249,12 @@ check_package_installed() {
         if [ "$installed_version" = "$required_version" ]; then
             return 0  # Already installed with correct version
         else
+            # If exact match is required, return 1 (need to install/upgrade)
+            if [ "$exact_match_only" = "true" ]; then
+                print_info "Package $name is installed with version $installed_version, but need exact version $required_version"
+                return 1  # Need to install/upgrade
+            fi
+            
             # Check if installed version is compatible (>= required)
             if compare_versions "$installed_version" "$required_version"; then
                 # For packages that are already installed with newer versions, skip reinstallation
@@ -269,21 +276,83 @@ check_package_installed() {
     fi
 }
 
+# Generic helpers for package installation loops
+install_package_entry() {
+    local package="$1"
+    local allow_skip="${2:-true}"
+    local enforce_exact="${3:-false}"
+    local extra_flags="${4:-}"
+    local progress_prefix="${5:-}"
+    local respect_fast_mode="${6:-true}"
+
+    local name=$(get_package_name "$package")
+    local version=$(get_exact_version "$package")
+    local can_skip="$allow_skip"
+
+    if [ "$allow_skip" = true ] && [ -n "$version" ]; then
+        if [ "$respect_fast_mode" = true ] && [ "$FAST_MODE" = true ]; then
+            can_skip=false
+        fi
+
+        if [ "$can_skip" = true ] && check_package_installed "$name" "$version" "$enforce_exact"; then
+            print_info "${progress_prefix}✓ $package is already installed"
+            return 0
+        fi
+    fi
+
+    print_info "${progress_prefix}Installing $package..."
+    if ! install_with_mirror_fallback "$package" "$extra_flags"; then
+        print_warning "${progress_prefix}Failed to install $package"
+        return 1
+    fi
+
+    return 0
+}
+
+install_package_group() {
+    local array_name="$1"
+    local allow_skip="${2:-true}"
+    local enforce_exact="${3:-false}"
+    local extra_flags="${4:-}"
+    local respect_fast_mode="${5:-true}"
+
+    local -n package_list="$array_name"
+    local total=${#package_list[@]}
+    local index=0
+
+    for package in "${package_list[@]}"; do
+        index=$((index + 1))
+        local prefix="[$index/$total] "
+        install_package_entry "$package" "$allow_skip" "$enforce_exact" "$extra_flags" "$prefix" "$respect_fast_mode"
+    done
+}
+
+prepare_cuda_environment() {
+    if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
+        print_info "CUDA environment ready for compilation packages"
+        export CUDA_HOME
+        export PATH="$CUDA_HOME/bin:$PATH"
+        export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+        return 0
+    fi
+
+    print_warning "CUDA environment not properly configured, some packages may fail to install"
+    return 1
+}
+
 # Install basic dependencies
 install_basic_deps() {
     print_info "Installing basic dependencies..."
-    
-    # Basic packages (no compilation required)
-    basic_packages=(
+
+    local -a basic_packages=(
+        "torch==2.8.0"
+        "torchvision==0.23.0"
+        "torchaudio==2.8.0"
         "sentence-transformers==4.1.0"
         "math-verify==0.7.0"
         "einops-exts==0.0.4"
         "deprecated==1.2.18"
-        "torch==2.6.0"
-        "torchvision==0.21.0" 
-        "torchaudio==2.6.0"
-        # "transformers==4.51.1"
-        "transformers==4.54.0"
+        "transformers==4.57.0"
         "accelerate==1.10.1"
         "peft==0.15.2"
         "trl==0.14.0"
@@ -321,24 +390,8 @@ install_basic_deps() {
         "ipython==9.2.0"
         "notebook==7.4.7"
     )
-    
-    local total=${#basic_packages[@]}
-    local current=0
-    
-    for package in "${basic_packages[@]}"; do
-        current=$((current + 1))
-        local name=$(get_package_name "$package")
-        local version=$(get_exact_version "$package")
-        
-        if [ -n "$version" ] && [ "$FAST_MODE" = false ] && check_package_installed "$name" "$version"; then
-            print_info "✓ [$current/$total] $package is already installed"
-        else
-            print_info "[$current/$total] Installing $package..."
-            install_with_mirror_fallback "$package" || {
-                print_warning "Failed to install $package, continuing with next package..."
-            }
-        fi
-    done
+
+    install_package_group basic_packages true false "" true
     
     print_success "Basic dependencies installation completed"
 }
@@ -347,57 +400,47 @@ install_basic_deps() {
 install_compile_deps() {
     print_info "Installing compilation dependencies..."
     
-    # Install compilation tools
-    compile_packages=(
+    local -a compile_packages=(
         "ninja==1.11.1.4"
         "einops==0.8.1"
     )
     
-    for package in "${compile_packages[@]}"; do
-        local name=$(get_package_name "$package")
-        local version=$(get_exact_version "$package")
-        
-        if [ -n "$version" ] && check_package_installed "$name" "$version"; then
-            print_info "✓ $package is already installed"
-        else
-            print_info "Installing $package..."
-            install_with_mirror_fallback "$package" || {
-                print_warning "Failed to install $package, continuing with next package..."
-            }
-        fi
-    done
+    install_package_group compile_packages true true "" false
 }
 
-# Try to install optional packages
-install_optional_packages() {
-    print_info "Installing optional packages..."
-    
-    # Ensure CUDA environment is properly set up for compilation packages
-    if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
-        print_info "CUDA environment ready for compilation packages"
-        export CUDA_HOME
-        export PATH="$CUDA_HOME/bin:$PATH"
-        export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
-    else
-        print_warning "CUDA environment not properly configured, some packages may fail to install"
-    fi
-    
-    # Install vllm dependencies first (before vllm itself)
+# Optional packages array (defined globally for use in help messages)
+optional_packages=(
+    "xformers==0.0.32.post1"
+    "bitsandbytes==0.45.3"
+    "vllm==0.11.0"
+    "sglang==0.5.2"
+    "mathruler==0.1.0"
+    "pylatexenc==2.10"
+)
+
+# Flash Attention version
+FLASH_ATTN_VERSION="2.8.1"
+
+prepare_vllm_dependencies() {
     print_info "Installing vllm dependencies..."
-    
-    # Fix lark version conflict first (vllm requires lark==1.2.2, but jupyterlab installed 1.3.0)
+
     print_info "Fixing lark version conflict (downgrading to 1.2.2 for vllm compatibility)..."
     install_with_mirror_fallback "lark==1.2.2" || {
         print_warning "Failed to downgrade lark, continuing..."
     }
-    
-    vllm_deps=(
+
+    print_info "Fixing dependency version conflicts for vllm 0.11.0 compatibility..."
+    pip uninstall -y outlines-core outlines_core compressed-tensors depyf lm-format-enforcer xgrammar 2>/dev/null || true
+
+    print_info "Skipping outlines (0.1.11) to keep outlines-core==0.2.11 required by vllm"
+
+    local -a vllm_deps=(
         "blake3"
         "cachetools"
-        "compressed-tensors==0.9.3"
-        "depyf==0.18.0"
+        "compressed-tensors==0.11.0"
+        "depyf==0.19.0"
         "gguf>=0.13.0"
-        "lm-format-enforcer<0.11,>=0.10.11"
+        "lm-format-enforcer==0.11.3"
         "mistral_common[opencv]>=1.5.4"
         "msgspec"
         "numba==0.61.2"
@@ -406,156 +449,156 @@ install_optional_packages() {
         "opentelemetry-exporter-otlp<1.27.0,>=1.26.0"
         "opentelemetry-sdk<1.27.0,>=1.26.0"
         "opentelemetry-semantic-conventions-ai<0.5.0,>=0.4.1"
-        "outlines==0.1.11"
+        "outlines-core==0.2.11"
         "partial-json-parser"
         "prometheus-fastapi-instrumentator>=7.0.0"
         "ray[cgraph]!=2.44.*,>=2.43.0"
         "tiktoken>=0.6.0"
         "watchfiles"
     )
-    
-    # Platform-specific dependencies
-    PLATFORM=$(uname -m)
-    if [ "$PLATFORM" = "x86_64" ] || [ "$PLATFORM" = "arm64" ] || [ "$PLATFORM" = "aarch64" ]; then
+
+    local platform
+    platform=$(uname -m)
+    if [ "$platform" = "x86_64" ] || [ "$platform" = "arm64" ] || [ "$platform" = "aarch64" ]; then
         vllm_deps+=("llguidance<0.8.0,>=0.7.9")
-        if [ "$PLATFORM" = "x86_64" ] || [ "$PLATFORM" = "aarch64" ]; then
-            vllm_deps+=("xgrammar==0.1.18")
+        if [ "$platform" = "x86_64" ] || [ "$platform" = "aarch64" ]; then
+            vllm_deps+=("xgrammar==0.1.25")
         fi
     fi
-    
+
     for package in "${vllm_deps[@]}"; do
-        local name=$(echo "$package" | cut -d'=' -f1 | cut -d'[' -f1)
-        # Extract version requirement if present
-        local version_req=$(echo "$package" | grep -oE '[>=<]+[0-9.]+' | head -1 || echo "")
-        
-        # Check if package is already installed (skip check for version ranges as they're complex)
-        if [ -z "$version_req" ]; then
-            if pip show "$name" &>/dev/null; then
-                print_info "✓ vllm dependency $name is already installed, skipping..."
-                continue
-            fi
+        local name
+        name=$(echo "$package" | cut -d'=' -f1 | cut -d'[' -f1)
+        local version_req
+        version_req=$(echo "$package" | grep -oE '[=<>!]+[0-9.]+' | head -1 || echo "")
+
+        if [ -z "$version_req" ] && pip show "$name" &>/dev/null; then
+            print_info "✓ vllm dependency $name is already installed, skipping..."
+            continue
         fi
-        
+
         print_info "Installing vllm dependency: $package..."
         install_with_mirror_fallback "$package" || {
             print_warning "Failed to install $package, continuing..."
         }
     done
-    
-    # Optional packages array
-    optional_packages=(
-        "xformers==0.0.29.post2"
-        "bitsandbytes==0.45.3"
-        "vllm==0.8.5.post1"
-        "sglang==0.4.6.post1"
-        "mathruler==0.1.0"
-        "pylatexenc==2.10"
-    )
-    
+}
+
+install_optional_core_packages() {
+    print_info "Installing optional helper packages..."
+
+    local total=${#optional_packages[@]}
+    local index=0
+
     for package in "${optional_packages[@]}"; do
-        local name=$(get_package_name "$package")
-        local version=$(get_exact_version "$package")
-        
-        if [ -n "$version" ] && check_package_installed "$name" "$version"; then
-            print_info "✓ $package is already installed"
-        else
-            print_info "Installing $package..."
-            
-            # Special handling for vllm: install without --no-deps since we already installed dependencies
-            if [ "$name" = "vllm" ]; then
-                install_with_mirror_fallback "$package" || {
-                    print_warning "$package installation failed, skipping..."
+        index=$((index + 1))
+        local prefix="[$index/$total] "
+        local name
+        name=$(get_package_name "$package")
+        local flags="--no-deps"
+
+        if [ "$name" = "vllm" ]; then
+            flags=""
+        fi
+
+        if ! install_package_entry "$package" true true "$flags" "$prefix" false; then
+            if [ "$flags" = "--no-deps" ]; then
+                print_warning "${prefix}$package installation failed with --no-deps, trying with dependencies..."
+                install_package_entry "$package" false true "" "$prefix" false || {
+                    print_warning "${prefix}$package installation failed, skipping..."
                 }
             else
-                # Use --no-deps to avoid reinstalling dependencies that may cause conflicts
-                install_with_mirror_fallback "$package" "--no-deps" || {
-                    print_warning "$package installation failed with --no-deps, trying with dependencies..."
-                    install_with_mirror_fallback "$package" || {
-                        print_warning "$package installation failed, skipping..."
-                    }
-                }
+                print_warning "${prefix}$package installation failed, skipping..."
             fi
         fi
     done
-    
-    # DeepSpeed (special handling due to CUDA requirements)
+}
+
+install_deepspeed_package() {
     if check_package_installed "deepspeed" "0.15.4"; then
         print_info "✓ deepspeed==0.15.4 is already installed"
-    else
-        print_info "Installing DeepSpeed..."
-        # Check if CUDA_HOME is properly set
-        if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
-            print_info "Using CUDA_HOME: $CUDA_HOME"
-            CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4" || {
-                print_warning "DeepSpeed installation failed, trying with no-build-isolation..."
-                CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4" "--no-build-isolation" || {
-                    print_warning "DeepSpeed installation failed, skipping..."
-                }
-            }
-        else
-            print_warning "CUDA_HOME not properly configured, skipping DeepSpeed installation"
-            print_info "To install DeepSpeed manually:"
-            echo "  export CUDA_HOME=/path/to/cuda"
-            echo "  pip install deepspeed==0.15.4"
-        fi
+        return
     fi
-    
-    # Flash Attention (special handling)
-    if check_package_installed "flash-attn" "2.7.4.post1"; then
-        print_info "✓ flash-attn==2.7.4.post1 is already installed"
-    else
-        print_info "Installing Flash Attention..."
-        
-        # Check if CUDA_HOME is properly set
-        if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
-            print_info "Using CUDA_HOME: $CUDA_HOME"
-            
-            # Detect Python version for the correct wheel
-            PYTHON_VERSION=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
-            print_info "Detected Python version tag: $PYTHON_VERSION"
-            
-            # Important notice before starting the installation
-            echo ""
-            print_info "⚠️  IMPORTANT: Flash Attention installation can be slow when building from source."
-            print_info "To speed up installation, you can download the pre-built wheel file:"
-            echo ""
-            echo "  1. Download the wheel file:"
-            echo "     wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-            echo ""
-            echo "  2. Install from the downloaded wheel:"
-            echo "     pip install flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-            echo ""
-            print_info "Press Ctrl+C now if you want to use the faster method above."
-            print_info "Otherwise, the installation will continue automatically in 5 seconds..."
-            sleep 5
-            echo ""
-            
-            # Try multiple strategies to install Flash Attention
-            print_info "Attempting Flash Attention installation from source (this may take several hours)..."
-            
-            # Try installing Flash Attention with mirror fallback
-            if install_with_mirror_fallback "flash-attn==2.7.4.post1" "--no-build-isolation"; then
-                print_success "Flash Attention installed successfully"
-            else
-                # All attempts failed
-                print_warning "Flash Attention installation failed after multiple attempts"
-                print_warning "This is optional and the project can run without it (with reduced performance)"
-                print_info "You can try installing it manually later with:"
-                echo "  Method 1 (Recommended - Using pre-built wheel):"
-                echo "    wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-                echo "    pip install flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-                echo ""
-                echo "  Method 2 (Build from source):"
-                echo "    export CUDA_HOME=$CUDA_HOME"
-                echo "    pip install flash-attn==2.7.4.post1 --no-build-isolation"
+
+    print_info "Installing DeepSpeed..."
+    if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
+        print_info "Using CUDA_HOME: $CUDA_HOME"
+        if ! CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4"; then
+            print_warning "DeepSpeed installation failed, trying with no-build-isolation..."
+            if ! CUDA_HOME="$CUDA_HOME" install_with_mirror_fallback "deepspeed==0.15.4" "--no-build-isolation"; then
+                print_warning "DeepSpeed installation failed, skipping..."
             fi
-        else
-            print_warning "CUDA_HOME not properly configured, skipping Flash Attention installation"
-            print_info "To install Flash Attention manually:"
-            echo "  export CUDA_HOME=/path/to/cuda"
-            echo "  pip install flash-attn==2.7.4.post1 --no-build-isolation"
         fi
+    else
+        print_warning "CUDA_HOME not properly configured, skipping DeepSpeed installation"
+        print_info "To install DeepSpeed manually:"
+        echo "  export CUDA_HOME=/path/to/cuda"
+        echo "  pip install deepspeed==0.15.4"
     fi
+}
+
+install_flash_attention_package() {
+    if check_package_installed "flash-attn" "$FLASH_ATTN_VERSION" "true"; then
+        print_info "✓ flash-attn==$FLASH_ATTN_VERSION is already installed"
+        return
+    fi
+
+    print_info "Installing Flash Attention..."
+
+    if [ -n "$CUDA_HOME" ] && [ -f "$CUDA_HOME/bin/nvcc" ]; then
+        print_info "Using CUDA_HOME: $CUDA_HOME"
+
+        local PYTHON_VERSION
+        PYTHON_VERSION=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
+        print_info "Detected Python version tag: $PYTHON_VERSION"
+
+        echo ""
+        print_info "⚠️  IMPORTANT: Flash Attention installation can be slow when building from source."
+        print_info "To speed up installation, you can download the pre-built wheel file:"
+        echo ""
+        echo "  1. Download the wheel file:"
+        echo "     wget https://github.com/Dao-AILab/flash-attention/releases/download/v$FLASH_ATTN_VERSION/flash_attn-$FLASH_ATTN_VERSION+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+        echo ""
+        echo "  2. Install from the downloaded wheel:"
+        echo "     pip install flash_attn-$FLASH_ATTN_VERSION+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+        echo ""
+        print_info "Press Ctrl+C now if you want to use the faster method above."
+        print_info "Otherwise, the installation will continue automatically in 20 seconds..."
+        sleep 20
+        echo ""
+
+        print_info "Attempting Flash Attention installation from source (this may take several hours)..."
+        if install_with_mirror_fallback "flash-attn==$FLASH_ATTN_VERSION" "--no-build-isolation"; then
+            print_success "Flash Attention installed successfully"
+        else
+            print_warning "Flash Attention installation failed after multiple attempts"
+            print_warning "This is optional and the project can run without it (with reduced performance)"
+            print_info "You can try installing it manually later (see instructions above) or use:"
+            echo "  Method 1 (Using pre-built wheel):"
+            echo "    wget https://github.com/Dao-AILab/flash-attention/releases/download/v$FLASH_ATTN_VERSION/flash_attn-$FLASH_ATTN_VERSION+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+            echo "    pip install flash_attn-$FLASH_ATTN_VERSION+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+            echo ""
+            echo "  Method 2 (Build from source):"
+            echo "    export CUDA_HOME=$CUDA_HOME"
+            echo "    pip install flash-attn==$FLASH_ATTN_VERSION --no-build-isolation"
+        fi
+    else
+        print_warning "CUDA_HOME not properly configured, skipping Flash Attention installation"
+        print_info "To install Flash Attention manually:"
+        echo "  export CUDA_HOME=/path/to/cuda"
+        echo "  pip install flash-attn==$FLASH_ATTN_VERSION --no-build-isolation"
+    fi
+}
+
+# Try to install optional packages
+install_optional_packages() {
+    print_info "Installing optional packages..."
+
+    prepare_cuda_environment
+    prepare_vllm_dependencies
+    install_optional_core_packages
+    install_deepspeed_package
+    install_flash_attention_package
 }
 
 # Install current package
@@ -646,11 +689,15 @@ main() {
     
     print_success "🎉 RLLaVA installation completed!"
     print_info "If some optional packages failed to install, you can install them separately later:"
-    echo "  pip install flash-attn==2.7.4.post1 --no-build-isolation"
-    echo "  pip install xformers==0.0.29.post2"
-    echo "  pip install bitsandbytes==0.45.3"
-    echo "  pip install vllm==0.8.5.post1"
-    echo "  pip install sglang==0.4.6.post1"
+    echo "  pip install flash-attn==$FLASH_ATTN_VERSION --no-build-isolation"
+    # Extract versions from optional_packages array for display
+    for package in "${optional_packages[@]}"; do
+        name=$(get_package_name "$package")
+        # Only show specific packages in the help message
+        if [[ "$name" == "xformers" ]] || [[ "$name" == "bitsandbytes" ]] || [[ "$name" == "vllm" ]] || [[ "$name" == "sglang" ]]; then
+            echo "  pip install $package"
+        fi
+    done
 }
 
 # Run main function

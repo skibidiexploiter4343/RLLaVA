@@ -1,31 +1,79 @@
 import inspect
-import torch
+import logging
 import re
 import time
-from typing import Optional, List, Iterable, Tuple, Dict, Union, TYPE_CHECKING
-from transformers import PreTrainedTokenizer, ProcessorMixin, PreTrainedModel
-from contextlib import contextmanager
-from .base import InferenceEngine
-from .. import register_engine
-from tensordict import TensorDict
-from vllm import LLM, SamplingParams
-from vllm import RequestOutput
+import torch
+from typing import Optional, List, Dict, Union, TYPE_CHECKING
+from packaging.version import InvalidVersion, Version
+from vllm import LLM, SamplingParams, RequestOutput
 from vllm.lora.request import LoRARequest
 from peft.utils.save_and_load import get_peft_model_state_dict
 from dataclasses import asdict
+from torch.distributed.tensor import DTensor
+from tensordict import TensorDict
+from transformers import PreTrainedTokenizer, ProcessorMixin, PreTrainedModel
+from contextlib import contextmanager
+from .. import register_engine
+from .base import InferenceEngine
 from .base import _get_logit_bias, _process_multi_modal_data, _repeat_interleave
 from .utils import TensorLoRARequest, VLLMHijack
 from rllava.data.protocol import DataProto
 from rllava.utils import torch_functional as VF
 from rllava.utils.model_utils import print_gpu_memory_usage
-from rllava.utils.torch_dtypes import PrecisionType
 from rllava.utils.transformers_compat import is_transformers_version_in_range
 from rllava.utils.device import get_device_id
-from torch.distributed.tensor import DTensor
+ 
  
 if TYPE_CHECKING:
     from rllava.ppo.config import RolloutConfig
 
+logger = logging.getLogger(__name__)
+
+
+def get_vllm_version() -> Optional[Version]:
+    try:
+        from vllm import __version__ as vllm_version
+    except Exception:
+        return None
+    try:
+        return Version(vllm_version)
+    except InvalidVersion:
+        return None
+
+
+def patch_qwen2_vl_cu_seqlens_on_cuda(vllm_version: Optional[Version]) -> None:
+    """Patch vLLM's Qwen2-VL attention to keep cu_seqlens on CUDA."""
+    min_fixed_version = Version("0.11.1")
+    if vllm_version is not None and vllm_version >= min_fixed_version:
+        return
+
+    try:
+        from vllm.model_executor.models.qwen2_vl import Qwen2VisionAttention
+    except Exception as exc:  # pragma: no cover - vllm import failures
+        logger.debug("Skip Qwen2-VL flash-attn patch: %s", exc)
+        return
+
+    if getattr(Qwen2VisionAttention, "_rllava_cu_patch", False):
+        return
+
+    original_forward = Qwen2VisionAttention.forward
+
+    def patched_forward(self, x, cu_seqlens, *args, **kwargs):
+        if torch.is_tensor(cu_seqlens) and hasattr(x, "device"):
+            target_device = x.device
+            if cu_seqlens.device != target_device:
+                cu_seqlens = cu_seqlens.to(target_device, non_blocking=True)
+        return original_forward(self, x, cu_seqlens, *args, **kwargs)
+
+    Qwen2VisionAttention.forward = patched_forward
+    Qwen2VisionAttention._rllava_cu_patch = True
+    logger.info("Patched vLLM Qwen2-VL attention to keep cu_seqlens on CUDA.")
+
+
+def apply_vllm_model_patches(model_name_or_path: str) -> None:
+    vllm_version = get_vllm_version()
+    if "qwen2-vl" in model_name_or_path.lower():
+        patch_qwen2_vl_cu_seqlens_on_cuda(vllm_version)
 
 
 @register_engine("vllm")
@@ -46,7 +94,10 @@ class VLLMEngine(InferenceEngine):
             if config.load_format == "safetensors"
             else {}
         )
+        apply_vllm_model_patches(model_name_or_path=model_name_or_path)
+        
         VLLMHijack.hijack()
+        
         self.inference_engine = LLM(
             model=model_name_or_path,
             skip_tokenizer_init=False,
@@ -129,6 +180,7 @@ class VLLMEngine(InferenceEngine):
                             prompts.meta_info["min_pixels"],
                             prompts.meta_info["max_pixels"],
                             prompts.meta_info["video_fps"],
+                            self.processor,
                         ),
                     }
                 )

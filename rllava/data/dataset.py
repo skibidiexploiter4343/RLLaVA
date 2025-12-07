@@ -211,7 +211,8 @@ class RLHFDataset(Dataset):
 
             processed_images = [] if len(images) != 0 else None  # text-only data
             for image in images:
-                processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
+                #processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
+                processed_images.append(process_image(image, self.min_pixels, self.max_pixels, self.processor))
 
             model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
             return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
@@ -252,7 +253,8 @@ class RLHFDataset(Dataset):
 
             processed_images = [] if len(images) != 0 else None  # text-only data
             for image in images:
-                processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
+                #processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
+                processed_images.append(process_image(image, self.min_pixels, self.max_pixels, self.processor))
 
             model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]

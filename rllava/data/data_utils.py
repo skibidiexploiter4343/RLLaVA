@@ -29,7 +29,7 @@ def collate_fn(features: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {**tensors, **non_tensors}
 
 def process_image(
-    image: Union[Dict[str, Any], ImageObject, str], min_pixels: Optional[int], max_pixels: Optional[int]
+    image: Union[Dict[str, Any], ImageObject, str], min_pixels: Optional[int], max_pixels: Optional[int], processor: Optional[Any] = None
 ) -> ImageObject:
     if isinstance(image, str):
         image = Image.open(image)
@@ -52,7 +52,55 @@ def process_image(
     if image.mode != "RGB":
         image = image.convert("RGB")
 
+    # 自适应处理模型的最小尺寸要求（如 Qwen2.5-VL 的 factor=28）
+    min_dimension = _get_min_dimension_from_processor(processor)
+    if min_dimension is not None:
+        if image.height < min_dimension or image.width < min_dimension:
+            # 计算需要放大的比例，确保最小边至少等于 min_dimension
+            scale = max(min_dimension / image.height, min_dimension / image.width)
+            new_height = max(int(image.height * scale), min_dimension)
+            new_width = max(int(image.width * scale), min_dimension)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
     return image
+
+
+def _get_min_dimension_from_processor(processor: Optional[Any]) -> Optional[int]:
+    """
+    从 processor 中提取模型要求的最小尺寸（如 Qwen2.5-VL 的 factor）
+    Args:
+        processor: 模型的 processor 对象       
+    Returns:
+        最小尺寸要求，如果无法获取则返回 None
+    """
+    if processor is None:
+        return None  
+    try:
+        # 尝试获取 image_processor
+        if hasattr(processor, 'image_processor'):
+            img_proc = processor.image_processor
+            
+            # Qwen2-VL / Qwen2.5-VL: patch_size * merge_size
+            if hasattr(img_proc, 'patch_size') and hasattr(img_proc, 'merge_size'):
+                factor = img_proc.patch_size * img_proc.merge_size
+                return factor
+            
+            # 直接配置的 min_size 或 size
+            if hasattr(img_proc, 'min_size'):
+                return img_proc.min_size
+            
+            # 某些模型在 size 配置中定义
+            if hasattr(img_proc, 'size'):
+                size = img_proc.size
+                if isinstance(size, dict) and 'shortest_edge' in size:
+                    return size['shortest_edge']
+                elif isinstance(size, (int, float)):
+                    return int(size)
+    except Exception:
+        # 如果提取失败，不抛异常，返回 None
+        pass
+    
+    return None
 
 def process_video(
     video: str, min_pixels: Optional[int], max_pixels: Optional[int], video_fps: float, return_fps: bool = False

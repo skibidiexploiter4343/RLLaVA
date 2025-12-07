@@ -112,7 +112,7 @@ def format_reward(response: str) -> float:
     elif '<answer>' in response and '</answer>' in response:
         match_answer = re.match(pattern_answer, response, re.DOTALL)
         match_search = re.match(pattern_search, response, re.DOTALL)
-        print(match_answer,match_search)
+        #print(match_answer,match_search)
         if match_answer and not match_search:
             return 1.0
         else:
@@ -121,7 +121,7 @@ def format_reward(response: str) -> float:
     elif '<search>' in response and '</search>' in response:
         match_answer = re.match(pattern_answer, response, re.DOTALL)
         match_search = re.match(pattern_search, response, re.DOTALL)
-        print(match_answer,match_search)
+        #print(match_answer,match_search)
         if match_search and not match_answer:
             return 1.0
         else:
@@ -134,7 +134,7 @@ def format_reward(response: str) -> float:
 def compute_score(reward_input: dict[str, Any], format_weight: float = 0.5) -> dict[str, float]:
     if not isinstance(reward_input, dict):
         raise ValueError("Please use `reward_type=sequential` for r1v reward function.")
-    print(reward_input["response"])
+    #print(reward_input["response"])
     format_score = format_reward(reward_input["response"])
     accuracy_score = accuracy_reward(reward_input["response"], reward_input["ground_truth"])
     return {

@@ -133,7 +133,7 @@ def main():
     
     config = init_config(PPOConfig)
 
-    tokenizer, processor = load_tokenizer_and_processor(config.actor.model.model_path)
+    tokenizer, processor = load_tokenizer_and_processor(config.actor.model.model_path, config.data.override_chat_template)
     
     train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
 

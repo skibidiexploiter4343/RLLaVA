@@ -297,7 +297,7 @@ class PPO():
                     images, videos = [], []
                     if "images" in multi_modal_data:
                         for image in multi_modal_data["images"]:
-                            images.append(process_image(image, min_pixels, max_pixels))
+                            images.append(process_image(image, min_pixels, max_pixels, self.processor))
 
                     if "videos" in multi_modal_data:
                         for video in multi_modal_data["videos"]:

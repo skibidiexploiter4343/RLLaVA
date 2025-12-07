@@ -12,21 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Utils for tokenization."""
-
+import os
+import json
 from typing import Optional
 
-from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizer, ProcessorMixin
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizer,
+    ProcessorMixin,
+)
 
 
 
-def load_tokenizer_and_processor(model_name_or_path):
+def load_tokenizer_and_processor(model_name_or_path, override_chat_template: Optional[str] = None):
+    if override_chat_template is not None:
+        if isinstance(override_chat_template, str) and os.path.isfile(override_chat_template):
+            try:
+                with open(override_chat_template, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "chat_template" in data:
+                    override_chat_template = data["chat_template"]
+            except Exception as e:
+                print(f"Failed to load chat_template from file '{override_chat_template}': {e}")
+
     tokenizer = get_tokenizer(
         model_name_or_path,
+        override_chat_template=override_chat_template,
         trust_remote_code=True,
         use_fast=True,
     )
     processor = get_processor(
         model_name_or_path,
+        override_chat_template=override_chat_template,
         trust_remote_code=True,
         use_fast=True,
     )
